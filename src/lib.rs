@@ -1,0 +1,30 @@
+#[cfg(not(unix))]
+compile_error!("isohypse requires a Unix platform: its socket security model depends on Unix domain sockets and peer-uid checks");
+
+pub mod normalize;
+pub mod tag;
+pub mod objects;
+pub mod patch;
+pub mod blocks;
+pub mod apply;
+pub mod edit;
+pub mod recovery;
+pub mod preview;
+pub mod patcher;
+pub mod graph;
+pub mod daemon;
+pub mod prompt;
+pub mod render;
+pub mod refs;
+pub mod semantic;
+pub mod buildspec;
+pub mod opresult;
+pub mod frame;
+pub mod session;
+pub mod serve;
+pub mod trace;
+pub mod lifecycle;
+pub mod trust;
+pub mod setup;
+pub mod machine;
+pub mod store;

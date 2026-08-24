@@ -1,0 +1,584 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://isohypse.dev/schema/v0.2.json",
+  "title": "isohypse op grammar v0.2",
+  "$comment": "v0.2: label required on every op and multi-op step, rendered as the output header. v0.1: initial grammar.",
+  "description": "Machine-readable schema for isohypse operations. Companion to isohypse.schema_v0.2.md, which is the source of truth for prose and intent.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/op"
+    },
+    {
+      "$ref": "#/$defs/multiOp"
+    },
+    {
+      "$ref": "#/$defs/sessionFrame"
+    }
+  ],
+  "$defs": {
+    "op": {
+      "description": "A single operation. Discriminated by the category.action name in `op`. Every op requires a label.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/contextOp"
+        },
+        {
+          "$ref": "#/$defs/mutateEdit"
+        },
+        {
+          "$ref": "#/$defs/mutateCreate"
+        },
+        {
+          "$ref": "#/$defs/mutateUndo"
+        },
+        {
+          "$ref": "#/$defs/verifyOp"
+        },
+        {
+          "$ref": "#/$defs/stateOp"
+        },
+        {
+          "$ref": "#/$defs/macroOp"
+        }
+      ]
+    },
+    "contextOp": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "enum": [
+            "context.read",
+            "context.find",
+            "context.explore",
+            "context.log",
+            "context.prompt"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "arg": {
+          "type": "string",
+          "description": "primary argument: file target, search terms, or two symbols for a call path"
+        },
+        "range": {
+          "type": "string",
+          "pattern": "^[0-9]+-[0-9]+$",
+          "description": "read only: line range START-END"
+        },
+        "outline": {
+          "type": "boolean"
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "op",
+        "label"
+      ],
+      "additionalProperties": false
+    },
+    "anchor": {
+      "description": "Where an edit acts. Symbol is preferred: order-independent, no line math.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "lines": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 2,
+              "maxItems": 2
+            }
+          },
+          "required": [
+            "lines"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "block": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "block"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "insertAnchor": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "before": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "const": "^"
+                }
+              ]
+            }
+          },
+          "required": [
+            "before"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "after": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "const": "$"
+                }
+              ]
+            }
+          },
+          "required": [
+            "after"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "edit": {
+      "description": "One action against one anchor.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "replace": {
+              "$ref": "#/$defs/anchor"
+            },
+            "with": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "replace",
+            "with"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "insert": {
+              "$ref": "#/$defs/insertAnchor"
+            },
+            "body": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "insert",
+            "body"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "delete": {
+              "$ref": "#/$defs/anchor"
+            }
+          },
+          "required": [
+            "delete"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "move": {
+              "type": "object",
+              "properties": {
+                "to": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "to"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "move"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "remove": {
+              "const": true
+            }
+          },
+          "required": [
+            "remove"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "mutateEdit": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "const": "mutate.edit"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "path": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "description": "the tag from the read that saw this file; guards against blind clobber"
+        },
+        "edits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/edit"
+          },
+          "minItems": 1
+        },
+        "checkpoint": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "op",
+        "label",
+        "path",
+        "tag",
+        "edits"
+      ],
+      "additionalProperties": false
+    },
+    "mutateCreate": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "const": "mutate.create"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "checkpoint": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "op",
+        "label",
+        "path",
+        "content"
+      ],
+      "additionalProperties": false
+    },
+    "mutateUndo": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "const": "mutate.undo"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "path": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "description": "optional: restore a specific recorded version by tag prefix"
+        },
+        "recover": {
+          "type": "boolean",
+          "description": "restore the last parse-valid version"
+        }
+      },
+      "required": [
+        "op",
+        "label",
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "verifyOp": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "enum": [
+            "verify.build",
+            "verify.check",
+            "verify.diagnose"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "arg": {
+          "type": "string",
+          "description": "check: the proposed edit; diagnose: the file"
+        },
+        "checkpoint": {
+          "type": "boolean",
+          "description": "run this verify mid-transaction; failure reverts the whole multi-op"
+        }
+      },
+      "required": [
+        "op",
+        "label"
+      ],
+      "additionalProperties": false
+    },
+    "stateOp": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "enum": [
+            "state.status",
+            "state.get",
+            "state.put",
+            "state.up",
+            "state.down",
+            "state.reload",
+            "state.stop"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "arg": {
+          "type": "string",
+          "description": "get: the tag; put: the content"
+        },
+        "path": {
+          "type": "string",
+          "description": "up/down: workspace root"
+        },
+        "reindex": {
+          "type": "boolean",
+          "description": "up: force a rebuild"
+        }
+      },
+      "required": [
+        "op",
+        "label"
+      ],
+      "additionalProperties": false
+    },
+    "macroOp": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "enum": [
+            "macro.save",
+            "macro.run",
+            "macro.list"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "required: short segment title, rendered as the output section header"
+        },
+        "name": {
+          "type": "string"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/op"
+          }
+        }
+      },
+      "required": [
+        "op",
+        "label"
+      ],
+      "additionalProperties": false
+    },
+    "multiOp": {
+      "type": "object",
+      "description": "Ordered atomic transaction. Any failed step reverts every mutation. A mutate step obliges a top-level validate. Each step is an op and carries its own label.",
+      "properties": {
+        "op": {
+          "const": "multi-op"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "steps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/op"
+              },
+              "minItems": 1
+            },
+            "validate": {
+              "type": "string",
+              "description": "a shell command to run at checkpoints and at close, or the literal \"none\" to waive"
+            }
+          },
+          "required": [
+            "steps"
+          ],
+          "additionalProperties": false,
+          "if": {
+            "properties": {
+              "steps": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "op": {
+                      "type": "string",
+                      "pattern": "^mutate\\."
+                    }
+                  },
+                  "required": [
+                    "op"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "validate"
+            ],
+            "description": "steps contain a mutate; validate is mandatory"
+          }
+        }
+      },
+      "required": [
+        "op",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "sessionFrame": {
+      "type": "object",
+      "description": "The connect/wire layer. Verbs carry on the `do` field.",
+      "properties": {
+        "do": {
+          "enum": [
+            "session.open",
+            "session.command",
+            "session.cancel",
+            "session.reload",
+            "session.subscribe",
+            "session.close",
+            "session.request",
+            "session.requests"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "description": "open: agent label"
+        },
+        "resume": {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session",
+            "token"
+          ],
+          "additionalProperties": false
+        },
+        "id": {
+          "description": "command/cancel: caller-chosen id echoed on replies"
+        },
+        "op": {
+          "type": "string",
+          "description": "command: the op name of the carried op object"
+        },
+        "payload": {
+          "type": "object",
+          "description": "command: the carried op object's fields, including its required label"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "subscribe: event kinds"
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "body": {
+          "type": "string",
+          "description": "request: the note text"
+        }
+      },
+      "required": [
+        "do"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

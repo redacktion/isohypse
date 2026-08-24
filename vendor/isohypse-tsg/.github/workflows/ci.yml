@@ -1,0 +1,45 @@
+name: Continuous integration
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 0 1,15 * *"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        rust: [stable]
+
+    steps:
+      - name: Install Rust environment
+        uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: ${{ matrix.rust }}
+      - name: Install Cargo plugins
+        run: |
+          rustup toolchain install nightly
+          cargo install cargo-hack cargo-minimal-versions
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Cache dependencies
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.OS }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.OS }}-cargo-
+      - name: Build library (all feature combinations)
+        run: cargo hack --feature-powerset --no-dev-deps build
+      - name: Test library (all feature combinations)
+        run: cargo hack --feature-powerset test
+      - name: Build library (minimal versions)
+        run: cargo minimal-versions build

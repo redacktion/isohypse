@@ -1,0 +1,9 @@
+[package]
+name = "isohypse-se"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent Secure Enclave P-256 signing for isohypse, via CryptoKit."
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
