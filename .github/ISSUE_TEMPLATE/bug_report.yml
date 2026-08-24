@@ -1,0 +1,153 @@
+name: Bug report
+description: Report broken Isohypse behavior, packaging, or output
+title: "[Bug]: "
+labels: ["bug"]
+assignees: "redacktion"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for reproducible problems in the op grammar, the CLI, the daemon and multi-agent layer, the index, the store, the session protocol, packaging, or the docs.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What broke?
+      description: Give a clear, concise summary of the bug.
+      placeholder: "Example: mutate.edit reports a clean apply but the file on disk is unchanged."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Op grammar / CLI
+        - Daemon and multi-agent
+        - The index (tree-sitter / stack-graphs / embeddings)
+        - Store and encryption
+        - Session protocol
+        - Setup and lifecycle
+        - Packaging and distribution
+        - Documentation
+        - GitHub templates
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Isohypse version
+      description: Output of `isohypse --version`, or the commit you built from.
+      placeholder: "0.1.0"
+    validations:
+      required: false
+
+  - type: input
+    id: harness
+    attributes:
+      label: Harness and version
+      description: If an agent harness was driving it, name the harness and version.
+      placeholder: "Example: Codex CLI 0.0.0, Claude Code 0.0.0"
+    validations:
+      required: false
+
+  - type: textarea
+    id: install_context
+    attributes:
+      label: Install context
+      description: How was Isohypse installed?
+      placeholder: "Example: cargo install isohypse, or built from source and codesigned."
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest sequence that reproduces the issue.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: op
+    attributes:
+      label: Op or command
+      description: Paste the op JSON, CLI invocation, or multi-op involved.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Paste relevant command output, errors, or daemon logs.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        OS:
+        Shell:
+        Isohypse version:
+        Install method:
+        Store mode (global/micro):
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: verification
+    attributes:
+      label: Verification
+      options:
+        - label: I can reproduce this with a documented install of Isohypse.
+          required: true
+        - label: This report includes the op or command and the exact output involved.
+          required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add links, prior art, or any other context here.
+    validations:
+      required: false

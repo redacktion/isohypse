@@ -1,0 +1,121 @@
+name: Feature request
+description: Suggest an idea for Isohypse
+title: "[Feature]: "
+labels: ["enhancement"]
+assignees: "redacktion"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement to Isohypse. Use this form for ideas that affect the op grammar, the CLI, the daemon and multi-agent layer, the index, the store, the session protocol, packaging, or the docs.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem?
+      description: Describe the problem or workflow friction this would solve.
+      placeholder: "Example: I want callers for a symbol across two repos in one call, but -w '*' only fans out reads I run separately."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: Explain what you want Isohypse to do differently.
+      placeholder: "Example: Add a context.explore flag that merges caller trees across live workspaces."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature area
+      description: Which part of Isohypse would this affect?
+      options:
+        - Op grammar / CLI
+        - Daemon and multi-agent
+        - The index (tree-sitter / stack-graphs / embeddings)
+        - Store and encryption
+        - Session protocol
+        - Setup and lifecycle
+        - Packaging and distribution
+        - Documentation
+        - Harness surface (extensions / hooks)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: change_type
+    attributes:
+      label: Type of change
+      options:
+        - New op or CLI flag
+        - Index or resolution behavior
+        - Daemon or session behavior
+        - Store or encryption behavior
+        - Packaging or distribution
+        - Documentation or example
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: example_op
+    attributes:
+      label: Example op or command
+      description: If useful, sketch the op JSON or CLI invocation this feature should support.
+      render: text
+      placeholder: '{"op":"context.explore","arg":"resize_image"}'
+    validations:
+      required: false
+
+  - type: textarea
+    id: harness_surface
+    attributes:
+      label: Proposed harness extension or hook
+      description: If this targets the harness surface (harness/<name>/extensions or hook-extension), sketch it here.
+      value: |
+        Harness (pi / codex / CC / OMP / other):
+        Type (extension / hook):
+        What it does:
+        How it makes the model reach for isohypse over the built-in tools:
+        Install path (harness/<name>/extensions or harness/<name>/hook-extension):
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Describe alternatives you've considered
+      description: List any other ops, flags, prompts, or workflows you considered.
+    validations:
+      required: false
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and migration impact
+      description: Note any affected platforms (macOS/Linux), the on-disk store format, existing ops, or migration concerns.
+      placeholder: "Example: This adds a field to the sealed session record and should migrate old sessions in place on startup."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Scope and safety
+      options:
+        - label: This request can be verified with a build, a test, or a documented check.
+          required: true
+        - label: This request does not weaken the store's encryption or the socket trust model without saying so explicitly.
+          required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add links, prior art, example commands, or other context here.
+    validations:
+      required: false
