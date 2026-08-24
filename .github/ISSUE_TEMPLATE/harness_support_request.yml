@@ -1,0 +1,71 @@
+name: Harness support request
+description: Request Isohypse recognition (a session prefix) for another agent harness
+title: "[Harness]: "
+labels: ["enhancement"]
+assignees: "redacktion"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Isohypse tags each session with a short harness prefix (`cdx` for Codex, `cld` for Claude Code, `pi` for Pi) so agents show up as named sessions in traces. Use this form to request a prefix and recognition for another harness.
+
+  - type: input
+    id: harness
+    attributes:
+      label: Harness name
+      description: Name the agent, editor, CLI, or workflow runner.
+      placeholder: "Example: Example Agent CLI"
+    validations:
+      required: true
+
+  - type: input
+    id: homepage
+    attributes:
+      label: Project or documentation URL
+      placeholder: "https://example.com/docs"
+    validations:
+      required: false
+
+  - type: input
+    id: prefix
+    attributes:
+      label: Suggested session prefix
+      description: A short, unique prefix for this harness's sessions.
+      placeholder: "Example: exa"
+    validations:
+      required: false
+
+  - type: textarea
+    id: invocation
+    attributes:
+      label: How does the harness call tools?
+      description: Explain how this harness runs external commands, so we know it can drive the Isohypse CLI or the session bridge.
+      placeholder: "Example: It runs shell commands and can pipe JSON over stdin/stdout, so it can open `isohypse session`."
+    validations:
+      required: true
+
+  - type: textarea
+    id: instruction_surface
+    attributes:
+      label: Where do persistent instructions live?
+      description: Name the always-loaded instruction file or config so users can point the harness at Isohypse.
+      placeholder: "Example: AGENTS.md at the repo root, or a project rule file."
+    validations:
+      required: false
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: How can this be tested after implementation?
+      placeholder: "Example: Open a session from the harness and confirm it appears with the new prefix in the trace."
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add links, examples, or other context here.
+    validations:
+      required: false
