@@ -1,0 +1,168 @@
+version: "3"
+
+silent: true
+
+vars:
+  BIN_DIR: '{{.HOME}}/bin'
+  IDENTITY: '{{.ISOHYPSE_CODESIGN_IDENTITY | default "isohypse-local"}}'
+  KEYCHAIN: '{{.HOME}}/Library/Keychains/login.keychain-db'
+
+tasks:
+  default:
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Tasks"
+        task --list | tail -n +2 | while IFS= read -r line; do row "${line#\* }"; done
+        phase_end
+        EOF
+
+  setup:
+    desc: One-time machine setup (toolchain, install dir, signing identity)
+    cmds:
+      - task: setup:toolchain
+      - task: setup:bin
+      - task: setup:identity
+
+  setup:toolchain:
+    internal: true
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Toolchain"
+        act "Checking cargo and codesign" "Toolchain verified." sh -c '
+          command -v cargo || { echo "cargo not found, install Rust from https://rustup.rs"; exit 1; }
+          command -v codesign || { echo "codesign not found, run xcode-select --install"; exit 1; }'
+        phase_end
+        EOF
+
+  setup:bin:
+    internal: true
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Install directory"
+        act "Creating {{.BIN_DIR}}" "Install directory ready." mkdir -p "{{.BIN_DIR}}"
+        case ":$PATH:" in
+          *":{{.BIN_DIR}}:"*) ok "{{.BIN_DIR}} is on PATH." ;;
+          *) note 'Add {{.BIN_DIR}} to PATH: export PATH="{{.BIN_DIR}}:$PATH"' ;;
+        esac
+        phase_end
+        EOF
+
+  setup:identity:
+    internal: true
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Signing identity"
+        if security find-identity -p codesigning | grep -q '"{{.IDENTITY}}"'; then
+          ok "{{.IDENTITY}} is already in the keychain."
+          phase_end
+          exit 0
+        fi
+        d=$(mktemp -d)
+        trap 'spin_stop; rm -rf "$d" "$LOG"' EXIT
+        cat > "$d/c.cnf" <<'CNF'
+        [req]
+        distinguished_name = dn
+        x509_extensions = ext
+        prompt = no
+        [dn]
+        CN = {{.IDENTITY}}
+        [ext]
+        basicConstraints = critical,CA:false
+        keyUsage = critical,digitalSignature
+        extendedKeyUsage = critical,codeSigning
+        CNF
+        gen() {
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$d/c.cnf" -keyout "$d/k.pem" -out "$d/c.pem" &&
+          /usr/bin/openssl pkcs12 -export -inkey "$d/k.pem" -in "$d/c.pem" -name "{{.IDENTITY}}" -passout pass:isohypse -out "$d/id.p12"
+        }
+        act "Generating the {{.IDENTITY}} certificate" "Certificate generated." gen
+        act "Importing into the login keychain" "Identity imported." security import "$d/id.p12" -k "{{.KEYCHAIN}}" -P isohypse -T /usr/bin/codesign
+        act "Trusting it for code signing, macOS asks for your password" "Identity trusted." security add-trusted-cert -r trustRoot -p codeSign -k "{{.KEYCHAIN}}" "$d/c.pem"
+        phase_end
+        EOF
+
+  build:
+    desc: Compile the release binary
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Build"
+        act "Compiling the release binary" "Release binary built." cargo build --release
+        phase_end
+        EOF
+
+  install:
+    desc: Build, sign, and install to {{.BIN_DIR}}/isohypse
+    cmds:
+      - task: build
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Stage"
+        act "Copying the binary to {{.BIN_DIR}}" "Binary staged." cp target/release/isohypse "{{.BIN_DIR}}/isohypse.staged"
+        phase_end
+        phase "Sign"
+        act "Signing with {{.IDENTITY}}" "Binary signed." codesign --force --sign "{{.IDENTITY}}" --identifier isohypse "{{.BIN_DIR}}/isohypse.staged"
+        phase_end
+        phase "Install"
+        act "Moving the binary into place" "Binary installed." mv -f "{{.BIN_DIR}}/isohypse.staged" "{{.BIN_DIR}}/isohypse"
+        phase_end
+        EOF
+      - task: verify
+
+  verify:
+    desc: Check the installed binary's signature and identifier
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Verify"
+        act "Verifying the signature" "Signature verified." codesign --verify --strict "{{.BIN_DIR}}/isohypse"
+        codesign --display --verbose=2 "{{.BIN_DIR}}/isohypse" 2>&1 | grep -E '^(Identifier|Authority)' | while IFS== read -r key value; do field "$key" "$value"; done
+        phase_end
+        EOF
+
+  check:
+    desc: Type-check all targets
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Check"
+        act "Type-checking all targets" "All targets type-check." cargo check --all-targets --release
+        phase_end
+        EOF
+
+  test:
+    desc: Run the Rust and harness tests
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Rust tests"
+        act "Running the Rust tests" "Rust tests passed." cargo test
+        phase_end
+        phase "Harness tests"
+        act "Running the harness tests" "Harness tests passed." sh -c 'for t in harness/tests/*.mjs; do node "$t" || exit 1; done'
+        phase_end
+        EOF
+
+  clean:
+    desc: Remove build output
+    cmds:
+      - |
+        bash <<'EOF'
+        . scripts/phase.sh
+        phase "Clean"
+        act "Removing build output" "Build output removed." cargo clean
+        phase_end
+        EOF

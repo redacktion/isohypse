@@ -1,39 +1,32 @@
-use std::io::Read;
 use std::path::PathBuf;
+use std::process::Command;
 
 use isohypse::daemon;
-use isohypse::patcher::Patcher;
-use isohypse::prompt::FORMAT_REFERENCE;
-use isohypse::render;
+use isohypse::prompt::{FORMAT_REFERENCE, HELP};
 use serde_json::json;
 
 const DAEMON_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 fn usage() -> ! {
-    eprintln!("usage: isohypse <category> <action> [args]   (categories: context mutate verify state macro; plus multi-op, session, setup)");
-    eprintln!("  context read [--outline] [--max-bytes N] <targets...>   exact bytes + tag; inline ranges a.rs:10-40,90-120");
-    eprintln!("  context explore <query...> | <from> <to>   symbols, callers, blast radius; two args = call path");
-    eprintln!("  context find [--name] [--any] <text...>    substring search over tracked source");
-    eprintln!("  context log [path]                         versions of a file; no path = workspace changelog");
-    eprintln!("  context prompt                             print the op-grammar reference");
-    eprintln!("  mutate edit --validate CMD|none [--diff]   anchored edits from JSON on stdin (symbol/lines/block)");
-    eprintln!("  mutate create <path>                       author a new file from stdin");
-    eprintln!("  mutate undo <path> [TAG] [--recover]       restore a recorded version");
-    eprintln!("  verify build                               run the workspace build");
-    eprintln!("  verify check                               validate mutate.edit JSON without writing");
-    eprintln!("  verify diagnose [path]                     parse and reference problems");
-    eprintln!("  state status | get <tag> | put             daemon state / object store");
-    eprintln!("  state up [root] [--reindex] [--foreground] start or ensure the tree (idempotent)");
-    eprintln!("  state down [root] | reload | stop          lifecycle (stop is password-gated while live)");
-    eprintln!("  macro save <name> | run <name> | list      named step sequences (steps JSON on stdin for save)");
-    eprintln!("  multi-op [--validate CMD|none] [--diff]    ordered steps, one atomic transaction (JSON on stdin)");
-    eprintln!("  session                                    NDJSON bridge (session.open / session.command / ...)");
-    eprintln!("  setup [--agent] [--global|--micro] [--inactive-hours N] [--cold-days N] [--encrypt all|none|LIST]   configure the store");
+    eprint!("{HELP}");
     std::process::exit(2);
 }
 
 fn cwd() -> PathBuf {
     std::env::current_dir().expect("current directory")
+}
+
+/// Canonicalize a workspace root, tolerating one that has just been deleted.
+/// /tmp/x and /private/tmp/x are one root to the supervisor, and a worker that
+/// outlives its directory still has to be addressable and stoppable.
+fn resolve_root(path: &std::path::Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent().and_then(|p| std::fs::canonicalize(p).ok()), path.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn read_hidden(prompt: &str) -> Result<String, String> {
@@ -66,9 +59,7 @@ fn authorize_stop() -> Result<Option<String>, String> {
         .into_iter()
         .filter(|(_, socket)| daemon::is_live(socket))
         .count();
-    if live == 0 {
-        return Ok(None);
-    }
+
     use std::os::unix::io::AsRawFd;
     let interactive = unsafe { libc::isatty(std::io::stdin().as_raw_fd()) } == 1;
     if !interactive {
@@ -86,18 +77,13 @@ fn authorize_stop() -> Result<Option<String>, String> {
 
 fn allowed_flags(command: &str) -> Option<&'static [&'static str]> {
     Some(match command {
-        "context.read" => &["--outline", "--max-bytes"],
-        "context.find" => &["--name", "--workspace", "-w", "--max", "--path", "--any"],
-        "context.explore" => &["--workspace", "-w", "--max", "--path", "--full"],
-        "mutate.edit" | "multi-op" => &["--validate", "--diff", "--workspace", "-w"],
-        "mutate.undo" => &["--recover"],
-        "daemon" | "state.reload" => &["--no-lsp", "--no-semantic"],
+        "daemon" | "state.reload" | "build" => &["--no-lsp", "--no-semantic"],
         "state.up" => &["--no-lsp", "--no-semantic", "--reindex", "--foreground"],
         "worker" => &["--lsp", "--semantic"],
         "services" => &["--semantic"],
-        "state.down" | "state.status" | "verify.build" | "verify.diagnose" => &["--workspace", "-w"],
-        "mutate.create" | "verify.check" | "context.log" | "context.prompt" | "state.get"
-        | "state.put" | "macro.save" | "macro.run" | "macro.list" | "session" | "state.stop" => &[],
+        "state.down" | "state.status" | "state.socket" | "state.stop" | "context.prompt" | "update.check" => &[],
+        "session" => &["--stdio"],
+        "call" | "hook" => &[],
         "setup" => &["--agent", "--global", "--micro", "--inactive-hours", "--cold-days", "--encrypt", "--reenable-agent"],
         _ => return None,
     })
@@ -118,60 +104,22 @@ fn reject_unknown_flags(args: &[String], allowed: &'static [&'static str]) -> Re
 
 fn subcommand_help(command: &str) -> Option<&'static str> {
     Some(match command {
-        "context.read" => "usage: isohypse context read [--outline] [--max-bytes N] <targets...>\n  print files as [PATH#TAG] headers plus N:TEXT rows.\n  a target is a path, optionally with inline ranges: src/a.rs:10-40,90-120.\n  --outline collapses bodies to signatures; --max-bytes caps output (capped lines stay unseen).",
-        "context.find" => "usage: isohypse context find [flags] <text...>\n  substring search over tracked source (needs the daemon). smart-case.\n  --name matches file paths; --any = each argument its own pattern; --path PREFIX restricts; --max N caps.",
-        "context.explore" => "usage: isohypse context explore [flags] <query...>\n  symbols with source, callers, and blast radius (needs the daemon).\n  two bare arguments are treated as <from> <to> and return the shortest call path.\n  --path PREFIX restrict; --max N cap; --full full tagged source.",
-        "context.log" => "usage: isohypse context log [path]\n  recorded versions of a file; with no path, the workspace changelog (newest first).",
-        "context.prompt" => "usage: isohypse context prompt\n  print the op-grammar reference (isohypse.schema_v0.1.md is the full spec).",
-        "mutate.edit" => "usage: isohypse mutate edit --validate CMD|none [--diff] [json-file]\n  anchored edits from JSON on stdin (or a file): {\"path\",\"tag\",\"edits\":[...]} or an array of those.\n  anchors: {\"symbol\":name} | {\"lines\":[a,b]} | {\"block\":N}; actions: replace/insert/delete/move/remove.\n  --validate CMD runs after writing and reverts everything on failure; --validate none waives it.",
-        "mutate.create" => "usage: isohypse mutate create <path>\n  author a new file from stdin and record a tag; fails if it already exists.",
-        "mutate.undo" => "usage: isohypse mutate undo <path> [TAG] [--recover]\n  restore the previous recorded version, a specific TAG prefix, or the last parse-valid with --recover.",
-        "verify.build" => "usage: isohypse verify build [--workspace SEL]\n  run the repo's detected build, or a .isohypse.build override.",
-        "verify.check" => "usage: isohypse verify check [json-file]\n  validate mutate.edit JSON end to end without writing; prints each file's diff.",
-        "verify.diagnose" => "usage: isohypse verify diagnose [path]\n  tree-sitter parse errors for a file plus the workspace build result.",
-        "state.status" => "usage: isohypse state status\n  daemon root, index counts, watcher, refs, semantic state, uptime.",
-        "state.up" => "usage: isohypse state up [root] [--reindex] [--foreground] [--no-lsp] [--no-semantic]\n  start the tree detached (idempotent). --reindex rebuilds the live workspace index; --foreground serves in this terminal.",
-        "state.down" => "usage: isohypse state down [root]\n  remove a workspace's worker; the tree keeps serving the rest.",
-        "state.reload" => "usage: isohypse state reload [--no-lsp] [--no-semantic]\n  gap-free handover of the whole tree onto a freshly built binary.",
-        "state.stop" => "usage: isohypse state stop\n  stop the tree; requires account-password authorization while workspaces are live.",
-        "state.get" => "usage: isohypse state get <tag>\n  fetch stored content by tag.",
-        "state.put" => "usage: isohypse state put\n  store stdin content and get a tag back.",
-        "macro.save" => "usage: isohypse macro save <name>\n  save a steps array (JSON on stdin) under a name.",
-        "macro.run" => "usage: isohypse macro run <name>\n  replay a saved macro in this workspace.",
-        "macro.list" => "usage: isohypse macro list\n  list saved macros.",
-        "multi-op" => "usage: isohypse multi-op [--validate CMD|none] [--diff] [steps-file]\n  ordered steps as one atomic transaction; JSON on stdin when no file is given (needs the daemon).\n  input: an array of op objects, or {\"steps\":[...],\"validate\":...}. Any mutate.* step requires validate.\n  a step may set \"checkpoint\":true to run validate right after it; any failure reverts every mutation.",
-        "session" => "usage: isohypse session\n  open the NDJSON bridge; speak session.open / session.command / session.cancel / session.reload / session.subscribe / session.request / session.requests / session.close.",
+        "call" => "Run one batch in a fresh session: isohypse call <<'EOF' {\"steps\":[...]} EOF. Reads the batch from stdin, or from the first argument. Prints the output, exits non-zero on failure.",
+        "hook" => "Answer an agent harness PreToolUse event on stdin. Denies Read, Grep, Glob, Edit, MultiEdit, Write and NotebookEdit inside a live Isohypse workspace and points at `isohypse call`.",
+        "session" => "Persistent session transport. The host opens once, matches results by request ID, and closes when finished.",
+        "context.prompt" => FORMAT_REFERENCE,
+        "build" => "Build, sign, and reload the runtime. Host maintenance only.",
+        "state.status" => "Report workspace state.",
+        "state.socket" => "Print the live workspace socket path for a root; exits non-zero when nothing answers.",
+        "state.up" => "Start or join the selected workspace. Preserve its authenticated identity.",
+        "state.down" => "Stop the selected workspace worker.",
+        "state.reload" => "Reload through the authenticated supervisor.",
+        "state.stop" => "Stop the supervisor and its workers. Requires interactive account authentication.",
+        "update.check" => "Check available runtime releases.",
+        "setup" => "Configure storage, identity, and access policy.",
         _ => return None,
     })
 }
-
-fn send_payload(payload: serde_json::Value) -> Result<String, String> {
-    if payload.get("workspace").and_then(|w| w.as_str()) == Some("*") {
-        let control = daemon::services_reachable()
-            .ok_or_else(|| "no services daemon for * fan-out; start the daemon".to_string())?;
-        let mut forward = payload.clone();
-        if let serde_json::Value::Object(map) = &mut forward {
-            map.remove("workspace");
-        }
-        return daemon::request(&control, &json!({"op": "fanout", "forward": forward}));
-    }
-    let socket = daemon::find_socket(&cwd()).ok_or_else(|| {
-        "no live daemon found from here upward; start one with `isohypse daemon` at the project root".to_string()
-    })?;
-    daemon::request(&socket, &payload)
-}
-
-fn daemon_call(op: &str, query: Option<&str>, workspace: Option<&str>) -> Result<String, String> {
-    let mut payload = json!({"op": op});
-    if let Some(query) = query {
-        payload["arg"] = json!(query);
-    }
-    if let Some(workspace) = workspace {
-        payload["workspace"] = json!(workspace);
-    }
-    send_payload(payload)
-}
-
 fn session_bridge(socket: &std::path::Path) -> Result<String, String> {
     use std::os::unix::net::UnixStream;
     let stream = UnixStream::connect(socket).map_err(|e| format!("cannot connect to session socket: {e}"))?;
@@ -183,187 +131,34 @@ fn session_bridge(socket: &std::path::Path) -> Result<String, String> {
     }
     let mut to_socket = stream.try_clone().map_err(|e| e.to_string())?;
     let mut from_socket = stream;
-    let pump = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let _ = std::io::copy(&mut stdin, &mut to_socket);
         let _ = to_socket.shutdown(std::net::Shutdown::Write);
     });
     let mut stdout = std::io::stdout();
-    let _ = std::io::copy(&mut from_socket, &mut stdout);
-    let _ = pump.join();
+    // The server can close while stdin is still open (close/reload/disconnect).
+    // Do not join a stdin reader that may remain blocked indefinitely.
+    std::io::copy(&mut from_socket, &mut stdout).map_err(|e| e.to_string())?;
     Ok(String::new())
 }
 
-fn pull_workspace(args: &[String]) -> (Option<String>, Vec<String>) {
-    let mut selector = None;
-    let mut rest = Vec::new();
-    let mut iter = args.iter();
-    while let Some(argument) = iter.next() {
-        if argument == "--workspace" || argument == "-w" {
-            selector = iter.next().cloned();
-        } else {
-            rest.push(argument.clone());
-        }
-    }
-    (selector, rest)
-}
 
-fn read_input_argument(args: &[String], position: usize) -> Result<String, String> {
-    match args.get(position) {
-        Some(file) => std::fs::read_to_string(file).map_err(|e| e.to_string()),
-        None => {
-            let mut buffer = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buffer)
-                .map(|_| buffer)
-                .map_err(|e| e.to_string())
-        }
-    }
-}
 
-fn explore_payload(args: &[String]) -> Option<serde_json::Value> {
-    let mut workspace: Option<String> = None;
-    let mut max: Option<u64> = None;
-    let mut paths: Vec<String> = Vec::new();
-    let mut full = false;
-    let mut query_parts: Vec<String> = Vec::new();
-    let mut rest = args.iter();
-    while let Some(argument) = rest.next() {
-        match argument.as_str() {
-            "--workspace" | "-w" => workspace = rest.next().cloned(),
-            "--max" => max = rest.next().and_then(|value| value.parse().ok()),
-            "--path" => {
-                if let Some(prefix) = rest.next() {
-                    paths.push(prefix.clone());
-                }
-            }
-            "--full" => full = true,
-            other => query_parts.push(other.to_string()),
-        }
-    }
-    if query_parts.is_empty() {
-        return None;
-    }
-    let mut payload = if query_parts.len() == 2 {
-        json!({ "op": "context.explore", "arg": query_parts[0], "to": query_parts[1] })
-    } else {
-        json!({ "op": "context.explore", "arg": query_parts.join(" "), "compact": !full, "full": full })
-    };
-    if let Some(max) = max {
-        payload["max"] = json!(max);
-    }
-    if !paths.is_empty() {
-        payload["paths"] = json!(paths);
-    }
-    if let Some(workspace) = workspace {
-        payload["workspace"] = json!(workspace);
-    }
-    Some(payload)
-}
 
-fn split_read_target(token: &str) -> Option<(&str, &str)> {
-    let (path, ranges) = token.rsplit_once(':')?;
-    if path.is_empty() || ranges.is_empty() {
-        return None;
-    }
-    if !ranges.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b',') {
-        return None;
-    }
-    if !ranges.bytes().any(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some((path, ranges))
-}
 
-type ReadTargets = Vec<(String, Vec<(Option<usize>, Option<usize>)>)>;
 
-fn append_ranges(
-    ranges: &mut Vec<(Option<usize>, Option<usize>)>,
-    ranges_part: &str,
-    token: &str,
-) -> Result<(), String> {
-    for piece in ranges_part.split(',') {
-        let piece = piece.trim();
-        let range = match piece.split_once('-') {
-            Some((a, b)) => a.parse::<usize>().ok().zip(b.parse::<usize>().ok()),
-            None => piece.parse::<usize>().ok().map(|line| (line, line)),
-        };
-        let Some((start, end)) = range else {
-            return Err(format!(
-                "bad range {piece:?} in {token:?}; use FILE:START-END[,START-END...] or FILE:LINE"
-            ));
-        };
-        ranges.push((Some(start), Some(end)));
-    }
-    Ok(())
-}
 
-fn parse_read_targets(
-    tokens: &[String],
-) -> Result<Option<ReadTargets>, String> {
-    let mut specs = Vec::with_capacity(tokens.len());
-    let mut any_ranged = false;
-    for token in tokens {
-        if let Some((path, ranges_part)) = split_read_target(token) {
-            let mut ranges = Vec::new();
-            append_ranges(&mut ranges, ranges_part, token)?;
-            any_ranged = true;
-            specs.push((path.to_string(), ranges));
-            continue;
-        }
-        let range_shaped = token.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b',')
-            && token.bytes().any(|b| b.is_ascii_digit());
-        match specs.last_mut() {
-            Some(last) if any_ranged && range_shaped => append_ranges(&mut last.1, token, token)?,
-            _ => specs.push((token.clone(), Vec::new())),
-        }
-    }
-    if any_ranged { Ok(Some(specs)) } else { Ok(None) }
-}
 
-fn find_payload(args: &[String]) -> Option<serde_json::Value> {
-    let mut name = false;
-    let mut any = false;
-    let mut workspace: Option<String> = None;
-    let mut max: Option<u64> = None;
-    let mut paths: Vec<String> = Vec::new();
-    let mut query_parts: Vec<String> = Vec::new();
-    let mut rest = args.iter();
-    while let Some(argument) = rest.next() {
-        match argument.as_str() {
-            "--name" => name = true,
-            "--any" => any = true,
-            "--workspace" | "-w" => workspace = rest.next().cloned(),
-            "--max" => max = rest.next().and_then(|value| value.parse().ok()),
-            "--path" => {
-                if let Some(prefix) = rest.next() {
-                    paths.push(prefix.clone());
-                }
-            }
-            other => query_parts.push(other.to_string()),
-        }
-    }
-    if query_parts.is_empty() {
-        return None;
-    }
-    let query = query_parts.join(" ");
-    let mut payload = json!({ "op": "context.find", "arg": query, "name": name });
-    if any {
-        payload["patterns"] = json!(query_parts);
-    }
-    if let Some(max) = max {
-        payload["max"] = json!(max);
-    }
-    if !paths.is_empty() {
-        payload["paths"] = json!(paths);
-    }
-    if let Some(workspace) = workspace {
-        payload["workspace"] = json!(workspace);
-    }
-    Some(payload)
-}
 
 fn start_detached(root: PathBuf, lsp: bool, semantic: bool, handover: bool) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    start_detached_from(exe, root, lsp, semantic, handover)
+}
+
+/// Launch a supervisor from an explicit image. A stateful reload must start the
+/// newly built binary, which is not this process's own executable.
+fn start_detached_from(exe: PathBuf, root: PathBuf, lsp: bool, semantic: bool, handover: bool) -> Result<String, String> {
     let socket = daemon::socket_path(&root);
     if !handover && daemon::is_live(&socket) {
         return Ok(format!("isohypse already up on {}\n", socket.display()));
@@ -371,7 +166,6 @@ fn start_detached(root: PathBuf, lsp: bool, semantic: bool, handover: bool) -> R
     if !handover {
         let _ = std::fs::remove_file(&socket);
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log_path = daemon::store_root().join("daemon.log");
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -417,15 +211,140 @@ fn start_detached(root: PathBuf, lsp: bool, semantic: bool, handover: bool) -> R
             Ok(())
         });
     }
-    let pid = command.spawn().map_err(|e| e.to_string())?.id();
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let pid = child.id();
     for _ in 0..100 {
-        if daemon::is_live(&socket) {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("isohypse startup failed: process {pid} exited with {status}; see {}", log_path.display()));
+        }
+        if daemon::supervisor_reachable().is_some() && daemon::is_live(&socket) {
             return Ok(format!("isohypse up (pid {pid}) on {}\n", socket.display()));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Ok(format!("isohypse starting (pid {pid}); indexing still underway, see {}\n", log_path.display()))
+    Err(format!("isohypse startup unconfirmed after 10 seconds (pid {pid}); inspect {} before retrying", log_path.display()))
 }
+
+fn build_and_reload(args: &[String]) -> Result<String, String> {
+    let lsp = !args.iter().any(|arg| arg == "--no-lsp");
+    let semantic = !args.iter().any(|arg| arg == "--no-semantic");
+    let root = args.iter().find(|arg| !arg.starts_with("--")).map(PathBuf::from).unwrap_or_else(cwd);
+    let root = resolve_root(&root);
+    let mut out = isohypse::output::Phases::new();
+    out.phase("Build");
+    out.working("Compiling the release binary");
+    let build = Command::new("cargo").args(["build", "--release"]).current_dir(&root).output().map_err(|error| format!("build could not start: {error}"))?;
+    if !build.status.success() {
+        out.fail("cargo build --release failed");
+        eprint!("{}", String::from_utf8_lossy(&build.stderr));
+        return Err(format!("cargo build --release failed with {}", build.status));
+    }
+    out.done("Release binary built.");
+    let running = std::env::current_exe().map_err(|error| format!("cannot locate running binary: {error}"))?;
+    let install = if running.extension().is_some_and(|ext| ext.to_string_lossy().starts_with("build-")) {
+        running.with_extension("")
+    } else { running };
+    let built = root.join("target/release/isohypse");
+    let nonce = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos());
+    let staged = install.with_extension(format!("build-{nonce}"));
+    out.phase("Stage");
+    out.working("Copying the binary next to the install path");
+    std::fs::copy(&built, &staged).map_err(|error| format!("cannot stage {} at {}: {error}", built.display(), staged.display()))?;
+    out.done("Binary staged.");
+    let identity = std::env::var("ISOHYPSE_CODESIGN_IDENTITY").unwrap_or_else(|_| "isohypse-local".to_string());
+    out.phase("Sign");
+    out.working(&format!("Signing with {identity}"));
+    let signed = Command::new("/usr/bin/codesign").args(["--force", "--sign"]).arg(&identity).args(["--identifier", "isohypse"]).arg(&staged).output().map_err(|error| format!("codesign could not start: {error}"))?;
+    if !signed.status.success() {
+        let _ = std::fs::remove_file(&staged);
+        out.fail(&format!("codesign failed for identity {identity}"));
+        eprint!("{}", String::from_utf8_lossy(&signed.stderr));
+        return Err(format!("codesign failed for identity {identity}: {}", signed.status));
+    }
+    out.done("Binary signed.");
+    // Stateful handover: install the new image, then start a replacement
+    // supervisor. It warms every worker before promoting the control and
+    // workspace sockets, so no client observes a cold or dead endpoint, and the
+    // running supervisor retires only once that promotion is visible.
+    out.phase("Install");
+    out.working(&format!("Promoting the staged image to {}", install.display()));
+    promote_release(&staged, &install, &nonce)?;
+    out.done("Release installed.");
+    out.phase("Reload");
+    out.working("Starting a replacement supervisor and retiring the running one");
+    daemon::supersede_supervisor();
+
+    let output = start_detached_from(staged.clone(), root, lsp, semantic, true)?;
+    out.done("Supervisor handed over.");
+    out.end();
+    Ok(format!("release build installed and signed with {identity}; {output}"))
+}
+
+// Running signed images must keep their vnode and a reachable path. Workers also
+// retain the staged path for crash recovery. Only the public symlink is replaced.
+fn promote_release(staged: &std::path::Path, install: &std::path::Path, nonce: &str) -> Result<(), String> {
+    let link = install.with_extension(format!("link-{nonce}"));
+    let retained = install.with_extension(format!("build-retained-{nonce}"));
+    std::os::unix::fs::symlink(staged, &link).map_err(|e| e.to_string())?;
+    let legacy = match std::fs::symlink_metadata(install) {
+        Ok(meta) if meta.is_file() => true,
+        Ok(meta) if meta.file_type().is_symlink() => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        _ => { let _ = std::fs::remove_file(&link); return Err("install target is not a file or symlink".into()); }
+    };
+    if legacy {
+        if retained.exists() { let _ = std::fs::remove_file(&link); return Err("retained image already exists".into()); }
+        if let Err(error) = std::fs::rename(install, &retained) {
+            let _ = std::fs::remove_file(&link);
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = std::fs::rename(&link, install) {
+        if legacy { let _ = std::fs::rename(&retained, install); }
+        let _ = std::fs::remove_file(&link);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn release_promotion_preserves_running_images() {
+    let root = std::env::temp_dir().join(format!("isohypse-promotion-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let install = root.join("isohypse");
+    let first = root.join("isohypse.build-first");
+    let second = root.join("isohypse.build-second");
+    std::fs::write(&install, "legacy").unwrap();
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+    promote_release(&first, &install, "first").unwrap();
+    promote_release(&second, &install, "second").unwrap();
+    let __ok0: bool = (std::fs::read_to_string(&install).unwrap()) == ("second");
+    let __ok1: bool = (std::fs::read_to_string(&first).unwrap()) == ("first");
+    let __ok2: bool = (std::fs::read_to_string(root.join("isohypse.build-retained-first")).unwrap()) == ("legacy");
+    let __ok3: bool = (std::fs::canonicalize(&install).unwrap()) == (std::fs::canonicalize(&second).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+
+    let failed: Vec<&str> = [(__ok0, "std::fs::read_to_string(&install).unwrap() == \"second\""), (__ok1, "std::fs::read_to_string(&first).unwrap() == \"first\""), (__ok2, "std::fs::read_to_string(root.join(\"isohypse.build-retained-first\")).un"), (__ok3, "std::fs::canonicalize(&install).unwrap() == std::fs::canonicalize(&sec")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+}
+
+fn update_check() -> Result<String, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let output = Command::new("/usr/bin/curl")
+        .args(["--fail", "--silent", "--show-error", "--max-time", "5", "https://api.github.com/repos/redacktion/isohypse/releases/latest"])
+        .output()
+        .map_err(|e| format!("update check unavailable: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("update check failed with {}", output.status));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("update metadata was invalid: {e}"))?;
+    let latest = payload.get("tag_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let url = payload.get("html_url").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(format!("installed: {current}\nlatest: {latest}\nrelease: {url}\n"))
+}
+
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -434,324 +353,79 @@ fn main() {
     }
     let args: Vec<String> = raw.into_iter().filter(|a| a != "--json").collect();
     let Some(first) = args.first() else { usage() };
-    if first != "setup" {
-        isohypse::store::resolve();
-    }
-    if first == "-h" || first == "--help" || first == "help" {
-        usage()
+    if first == "-h" || first == "--help" || first == "help" { print!("{HELP}"); return; }
+    if first != "setup" && first != "hook" {
+        if let Err(error) = isohypse::store::resolve() { eprintln!("isohypse: {error}"); std::process::exit(1); }
     }
     let (command, rest): (String, Vec<String>) = match first.as_str() {
-        "context" | "mutate" | "verify" | "state" | "macro" => {
+        "context" | "state" | "update" => {
             let Some(action) = args.get(1) else { usage() };
             (format!("{first}.{action}"), args[2..].to_vec())
         }
         _ => (first.clone(), args[1..].to_vec()),
     };
     if rest.iter().any(|a| a == "-h" || a == "--help") {
-        if let Some(help) = subcommand_help(&command) {
-            println!("{help}");
-            std::process::exit(0);
-        }
+        if let Some(help) = subcommand_help(&command) { println!("{help}"); std::process::exit(0); }
         usage()
     }
     if let Some(allowed) = allowed_flags(command.as_str()) {
-        if let Err(message) = reject_unknown_flags(&rest, allowed) {
-            eprintln!("isohypse: {message}");
-            std::process::exit(1);
-        }
+        if let Err(message) = reject_unknown_flags(&rest, allowed) { eprintln!("isohypse: {message}"); std::process::exit(1); }
     }
     let outcome: Result<String, String> = match command.as_str() {
-        "context.read" => {
-            let mut outline = false;
-            let mut max_bytes: Option<usize> = None;
-            let mut positional: Vec<String> = Vec::new();
-            let mut it = rest.iter();
-            while let Some(argument) = it.next() {
-                match argument.as_str() {
-                    "--outline" => outline = true,
-                    "--max-bytes" => max_bytes = it.next().and_then(|value| value.parse().ok()),
-                    other => positional.push(other.to_string()),
-                }
-            }
-            if positional.is_empty() {
-                usage()
-            }
-            let first_target = positional[0].clone();
-            match parse_read_targets(&positional) {
-                Err(e) => Err(e),
-                Ok(Some(specs)) => Patcher::new(cwd()).and_then(|mut patcher| {
-                    let mut out = String::new();
-                    let mut omitted: Vec<String> = Vec::new();
-                    for (path, ranges) in &specs {
-                        let remaining = match max_bytes {
-                            Some(cap) if out.len() >= cap => {
-                                omitted.push(path.clone());
-                                continue;
-                            }
-                            Some(cap) => Some(cap - out.len()),
-                            None => None,
-                        };
-                        let ranged = if ranges.is_empty() { vec![(None, None)] } else { ranges.clone() };
-                        out.push_str(&patcher.read_multi(path, &ranged, outline, remaining)?);
-                    }
-                    if !omitted.is_empty() {
-                        out.push_str(&format!(
-                            "({} file(s) past the --max-bytes cap not shown: {}; read them in a follow-up call)\n",
-                            omitted.len(),
-                            omitted.join(", ")
-                        ));
-                    }
-                    Ok(out)
-                }),
-                Ok(None) => {
-                    let has_ranges = positional[1..].iter().any(|t| t.contains('-'));
-                    if has_ranges {
-                        let mut ranges: Vec<(Option<usize>, Option<usize>)> = Vec::new();
-                        let mut parse_error: Option<String> = None;
-                        for token in &positional[1..] {
-                            match token.split_once('-') {
-                                Some((a, b)) => match (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
-                                    (Ok(start), Ok(end)) => ranges.push((Some(start), Some(end))),
-                                    _ => parse_error = Some(format!("bad range {token:?}; use START-END")),
-                                },
-                                None => parse_error = Some(format!("bad range {token:?}; use START-END")),
-                            }
-                        }
-                        match parse_error {
-                            Some(e) => Err(e),
-                            None => Patcher::new(cwd())
-                                .and_then(|mut patcher| patcher.read_multi(&first_target, &ranges, outline, max_bytes)),
-                        }
-                    } else if positional.len() >= 2 && positional[1].parse::<usize>().is_err() {
-                        Patcher::new(cwd()).and_then(|mut patcher| {
-                            let mut out = String::new();
-                            let mut omitted: Vec<&str> = Vec::new();
-                            for file in &positional {
-                                let remaining = match max_bytes {
-                                    Some(cap) if out.len() >= cap => {
-                                        omitted.push(file.as_str());
-                                        continue;
-                                    }
-                                    Some(cap) => Some(cap - out.len()),
-                                    None => None,
-                                };
-                                out.push_str(&patcher.read_with(file, None, None, outline, remaining)?);
-                            }
-                            if !omitted.is_empty() {
-                                out.push_str(&format!(
-                                    "({} file(s) past the --max-bytes cap not shown: {}; read them in a follow-up call)\n",
-                                    omitted.len(),
-                                    omitted.join(", ")
-                                ));
-                            }
-                            Ok(out)
-                        })
-                    } else if positional.len() > 3 {
-                        Err(format!("unexpected argument {:?}; a single-file read takes at most [start] [end]", positional[3]))
-                    } else {
-                        let start = positional.get(1).and_then(|v| v.parse().ok());
-                        let end = positional.get(2).and_then(|v| v.parse().ok());
-                        Patcher::new(cwd())
-                            .and_then(|mut patcher| patcher.read_with(&first_target, start, end, outline, max_bytes))
-                    }
-                }
-            }
-        }
-        "mutate.edit" => (|| {
-            let mut validate: Option<String> = None;
-            let mut diff = false;
-            let mut selector: Option<String> = None;
-            let mut positional: Vec<String> = Vec::new();
-            let mut it = rest.iter();
-            while let Some(argument) = it.next() {
-                match argument.as_str() {
-                    "--validate" => validate = it.next().cloned(),
-                    "--diff" => diff = true,
-                    "--workspace" | "-w" => selector = it.next().cloned(),
-                    _ => positional.push(argument.clone()),
-                }
-            }
-            let validate = validate
-                .ok_or_else(|| "mutate.edit needs --validate CMD, or --validate none to waive it".to_string())?;
-            let raw = read_input_argument(&positional, 0)?;
-            let parsed: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| format!("mutate.edit takes JSON: {e}"))?;
-            if let Some(socket) = daemon::find_socket(&cwd()).filter(|socket| daemon::is_live(socket)) {
-                let mut payload = json!({
-                    "op": "mutate.edit",
-                    "cwd": cwd().to_string_lossy(),
-                    "quiet": !diff,
-                    "validate": validate,
-                });
-                match &parsed {
-                    serde_json::Value::Array(items) => payload["ops"] = json!(items),
-                    serde_json::Value::Object(source) => {
-                        if let serde_json::Value::Object(target) = &mut payload {
-                            for (key, value) in source {
-                                if key != "op" {
-                                    target.insert(key.clone(), value.clone());
-                                }
-                            }
-                        }
-                    }
-                    _ => return Err("mutate.edit takes an op object or an array of them".to_string()),
-                }
-                if let Some(ws) = &selector {
-                    payload["workspace"] = json!(ws);
-                }
-                daemon::request(&socket, &payload)
-            } else {
-                let mut patcher = Patcher::new(cwd())?;
-                let effective = if validate == "none" { None } else { Some(validate.clone()) };
-                let report = patcher.apply_edits_verified(&parsed, effective.as_deref())?;
-                Ok(render::apply_report(&report, !diff))
-            }
-        })(),
-        "multi-op" => (|| {
-            let mut validate: Option<String> = None;
-            let mut diff = false;
-            let mut selector: Option<String> = None;
-            let mut positional: Vec<String> = Vec::new();
-            let mut it = rest.iter();
-            while let Some(argument) = it.next() {
-                match argument.as_str() {
-                    "--validate" => validate = it.next().cloned(),
-                    "--diff" => diff = true,
-                    "--workspace" | "-w" => selector = it.next().cloned(),
-                    _ => positional.push(argument.clone()),
-                }
-            }
-            let raw = read_input_argument(&positional, 0)?;
-            let parsed: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| format!("multi-op steps must be JSON: {e}"))?;
-            let (steps, embedded_validate) = match parsed {
-                serde_json::Value::Array(items) => (items, None),
-                serde_json::Value::Object(map) => {
-                    let steps = map
-                        .get("steps")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .ok_or_else(|| "multi-op object needs a steps array".to_string())?;
-                    (steps, map.get("validate").cloned())
-                }
-                _ => return Err("multi-op input must be a JSON array of steps or an object with a steps array".to_string()),
-            };
-            let socket = daemon::find_socket(&cwd()).ok_or_else(|| {
-                "no live daemon found from here upward; multi-op needs a running daemon".to_string()
-            })?;
-            let mut payload = json!({
-                "op": "multi-op",
-                "steps": steps,
-                "cwd": cwd().to_string_lossy(),
-                "quiet": !diff,
-            });
-            if let Some(command) = &validate {
-                payload["validate"] = json!(command);
-            } else if let Some(embedded) = embedded_validate {
-                payload["validate"] = embedded;
-            }
-            if let Some(ws) = &selector {
-                payload["workspace"] = json!(ws);
-            }
-            daemon::request(&socket, &payload)
-        })(),
-        "mutate.create" => {
-            let Some(path) = rest.first() else { usage() };
-            let mut content = String::new();
-            match std::io::stdin().read_to_string(&mut content) {
-                Ok(_) => Patcher::new(cwd()).and_then(|mut patcher| patcher.create(path, &content)),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "context.find" => match find_payload(&rest) {
-            Some(payload) => send_payload(payload),
-            None => usage(),
-        },
-        "verify.check" => read_input_argument(&rest, 0).and_then(|raw| {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| format!("verify.check takes mutate.edit JSON: {e}"))?;
-            let mut patcher = Patcher::new(cwd())?;
-            let report = patcher.check_edits(&parsed)?;
-            Ok(render::check_report(&report))
-        }),
-        "context.log" => match rest.first() {
-            Some(path) => Patcher::new(cwd()).and_then(|patcher| patcher.log(path)),
-            None => Patcher::new(cwd()).and_then(|patcher| patcher.changelog()),
-        },
-        "mutate.undo" => {
-            let mut recover = false;
-            let mut positional: Vec<String> = Vec::new();
-            for argument in &rest {
-                match argument.as_str() {
-                    "--recover" => recover = true,
-                    other => positional.push(other.to_string()),
-                }
-            }
-            let Some(path) = positional.first().cloned() else { usage() };
-            if positional.len() > 2 {
-                eprintln!("isohypse: unexpected argument {:?}; undo takes <path> [TAG]", positional[2]);
-                std::process::exit(1);
-            }
-            let tag = positional.get(1).cloned();
-            Patcher::new(cwd()).and_then(|mut patcher| patcher.undo_with(&path, tag.as_deref(), recover))
-        }
-        "context.explore" => match explore_payload(&rest) {
-            Some(payload) => send_payload(payload),
-            None => usage(),
-        },
         "state.status" => {
-            let (selector, _) = pull_workspace(&rest);
-            daemon_call("state.status", None, selector.as_deref())
+            let socket = daemon::find_socket(&cwd()).ok_or_else(|| "no live daemon found".to_string());
+            socket.and_then(|s| daemon::request(&s, &json!({"op": "state.status"})))
+        }
+        // Harness-facing liveness probe. A socket file is not evidence that a
+        // daemon is alive, and the sockets no longer sit inside the workspace to
+        // be counted, so this answers by connecting and exits non-zero otherwise.
+        "state.socket" => {
+            let root = rest.first().map(PathBuf::from).unwrap_or_else(cwd);
+            let root = resolve_root(&root);
+            let socket = daemon::socket_path(&root);
+            if daemon::is_live(&socket) {
+                Ok(format!("{}\n", socket.display()))
+            } else {
+                Err(format!("no live daemon for {} ({} does not answer)", root.display(), socket.display()))
+            }
         }
         "state.stop" => authorize_stop().and_then(|password| {
             let mut body = json!({"op": "stop"});
-            if let Some(pw) = &password {
-                body["password"] = json!(pw);
-            }
-            match daemon::supervisor_reachable() {
+            if let Some(pw) = &password { body["password"] = json!(pw); }
+            let stopped = match daemon::supervisor_reachable() {
                 Some(control) => daemon::request(&control, &body),
-                None => match daemon::find_socket(&cwd()) {
-                    Some(socket) => daemon::request(&socket, &body),
-                    None => Err("no live isohypse process found".to_string()),
-                },
+                None => daemon::recover_supervisor(password.as_deref().unwrap_or_default()),
+            };
+            if stopped.is_ok() {
+                daemon::clear_all_enforcement();
             }
+            stopped
         }),
         "daemon" => {
-            let lsp_enabled = !rest.iter().any(|a| a == "--no-lsp");
-            let semantic_enabled = !rest.iter().any(|a| a == "--no-semantic");
-            let root = rest
-                .iter()
-                .find(|a| !a.starts_with("--"))
-                .map(PathBuf::from)
-                .unwrap_or_else(cwd);
-            daemon::run_supervisor(root, lsp_enabled, semantic_enabled).map(|_| String::new())
+            let lsp = !rest.iter().any(|a| a == "--no-lsp");
+            let semantic = !rest.iter().any(|a| a == "--no-semantic");
+            let root = rest.iter().find(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or_else(cwd);
+            daemon::run_supervisor(root, lsp, semantic).map(|_| String::new())
         }
         "worker" => {
-            let lsp_enabled = rest.iter().any(|a| a == "--lsp");
-            let semantic_enabled = rest.iter().any(|a| a == "--semantic");
-            let root = rest
-                .iter()
-                .find(|a| *a != "--lsp" && *a != "--semantic")
-                .map(PathBuf::from)
-                .unwrap_or_else(cwd);
-            daemon::run_worker(root, lsp_enabled, semantic_enabled).map(|_| String::new())
+            let lsp = rest.iter().any(|a| a == "--lsp");
+            let semantic = rest.iter().any(|a| a == "--semantic");
+            let root = rest.iter().find(|a| *a != "--lsp" && *a != "--semantic").map(PathBuf::from).unwrap_or_else(cwd);
+            daemon::run_worker(root, lsp, semantic).map(|_| String::new())
         }
         "services" => daemon::run_services(rest.iter().any(|a| a == "--semantic")).map(|_| String::new()),
         "state.up" => {
             let reindex = rest.iter().any(|a| a == "--reindex");
             let foreground = rest.iter().any(|a| a == "--foreground");
-            let lsp_enabled = !rest.iter().any(|a| a == "--no-lsp");
-            let semantic_enabled = !rest.iter().any(|a| a == "--no-semantic");
-            let root = rest
-                .iter()
-                .find(|a| !a.starts_with("--"))
-                .map(PathBuf::from)
-                .unwrap_or_else(cwd);
-            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            let lsp = !rest.iter().any(|a| a == "--no-lsp");
+            let semantic = !rest.iter().any(|a| a == "--no-semantic");
+            let root = rest.iter().find(|a| !a.starts_with("--")).map(PathBuf::from).unwrap_or_else(cwd);
+            let root = resolve_root(&root);
             if reindex {
-                send_payload(json!({"op": "state.up", "reindex": true}))
+                let socket = daemon::find_socket(&cwd()).ok_or_else(|| "no live daemon found".to_string());
+                socket.and_then(|s| daemon::request(&s, &json!({"op": "state.up", "reindex": true, "workspace": root.to_string_lossy()})))
             } else if foreground {
-                daemon::run_supervisor(root, lsp_enabled, semantic_enabled).map(|_| String::new())
+                daemon::run_supervisor(root, lsp, semantic).map(|_| String::new())
             } else {
                 let socket = daemon::socket_path(&root);
                 if daemon::is_live(&socket) {
@@ -759,75 +433,41 @@ fn main() {
                 } else if let Some(control) = daemon::supervisor_reachable() {
                     daemon::request(&control, &json!({"op": "spawn", "root": root.to_string_lossy()}))
                 } else {
-                    start_detached(root, lsp_enabled, semantic_enabled, false)
+                    start_detached(root, lsp, semantic, false)
                 }
             }
         }
-        "verify.build" => {
-            let (selector, _) = pull_workspace(&rest);
-            match daemon::find_socket(&cwd()).filter(|socket| daemon::is_live(socket)) {
-                Some(socket) => {
-                    let mut payload = json!({"op": "verify.build"});
-                    if let Some(ws) = &selector {
-                        payload["workspace"] = json!(ws);
-                    }
-                    daemon::request(&socket, &payload)
-                }
-                None => match isohypse::buildspec::detect(&cwd()) {
-                    Some(spec) => {
-                        let outcome = isohypse::buildspec::run(&cwd(), &spec);
-                        let rendered = isohypse::buildspec::render(&outcome);
-                        if outcome.ok {
-                            Ok(rendered)
-                        } else {
-                            Err(rendered)
-                        }
-                    }
-                    None => Err("no build command detected; add a .isohypse.build file with the command".to_string()),
-                },
-            }
-        }
+        "build" => build_and_reload(&rest),
         "state.down" => {
-            let (_, positional) = pull_workspace(&rest);
-            let root = positional.first().map(PathBuf::from).unwrap_or_else(cwd);
-            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            let root = rest.first().map(PathBuf::from).unwrap_or_else(cwd);
+            let root = resolve_root(&root);
             match daemon::supervisor_reachable() {
-                Some(control) => daemon::request(
-                    &control,
-                    &json!({"op": "kill", "root": root.to_string_lossy()}),
-                ),
+                Some(control) => daemon::request(&control, &json!({"op": "kill", "root": root.to_string_lossy()})),
                 None => Err("no live supervisor found".to_string()),
             }
         }
+        "update.check" => update_check(),
         "context.prompt" => Ok(FORMAT_REFERENCE.to_string()),
-        "verify.diagnose" => {
-            let (selector, positional) = pull_workspace(&rest);
-            daemon_call("verify.diagnose", positional.first().map(String::as_str), selector.as_deref())
+        "call" => {
+            let input = match rest.first() {
+                Some(batch) => Ok(batch.clone()),
+                None => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::Read::take(std::io::stdin(), isohypse::call::MAX_INPUT_BYTES as u64 + 1), &mut text).map(|_| text).map_err(|e| format!("cannot read stdin: {e}"))
+                }
+            };
+            input.and_then(|batch| match daemon::find_socket(&cwd()).and_then(|s| daemon::session_socket_beside(&s)) {
+                Some(socket) => isohypse::call::run(&socket, &batch).map_err(|e| e.to_string()),
+                None => Err("no live daemon found from here upward; run `isohypse state up .`".to_string()),
+            })
         }
-        "state.get" => {
-            let Some(tag) = rest.first() else { usage() };
-            daemon_call("state.get", Some(tag), None)
+        "hook" => {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text);
+            let off = std::env::var("ISOHYPSE_HOOK").is_ok_and(|v| v == "off");
+            Ok(isohypse::hook::respond(&text, off, &isohypse::hook::FsProbe))
         }
-        "state.put" => {
-            let mut content = String::new();
-            std::io::stdin()
-                .read_to_string(&mut content)
-                .map_err(|e| e.to_string())
-                .and_then(|_| daemon_call("state.put", Some(&content), None))
-        }
-        "macro.save" => (|| {
-            let Some(name) = rest.first() else { usage() };
-            let raw = read_input_argument(&rest, 1)?;
-            let steps: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| format!("macro.save takes a JSON steps array: {e}"))?;
-            send_payload(json!({"op": "macro.save", "name": name, "steps": steps}))
-        })(),
-        "macro.run" => {
-            let Some(name) = rest.first() else { usage() };
-            send_payload(json!({"op": "macro.run", "name": name}))
-        }
-        "macro.list" => daemon_call("macro.list", None, None),
-        "session" => match daemon::find_socket(&cwd()).and_then(|s| s.parent().map(|p| p.join(".isohypse.session.sock"))) {
+        "session" => match daemon::find_socket(&cwd()).and_then(|s| daemon::session_socket_beside(&s)) {
             Some(socket) => session_bridge(&socket),
             None => Err("no live daemon found from here upward".to_string()),
         },
@@ -836,15 +476,17 @@ fn main() {
             let lsp = !rest.iter().any(|a| a == "--no-lsp");
             let semantic = !rest.iter().any(|a| a == "--no-semantic");
             let root = std::fs::canonicalize(cwd()).unwrap_or_else(|_| cwd());
+            // Stateful reload: the replacement supervisor warms every workspace
+            // with this image and then takes over the sockets. The running
+            // supervisor retires only once the new control socket is promoted.
+            daemon::supersede_supervisor();
+
             start_detached(root, lsp, semantic, true)
         }
         _ => usage(),
     };
     match outcome {
         Ok(output) => print!("{output}"),
-        Err(message) => {
-            eprintln!("isohypse: {message}");
-            std::process::exit(1);
-        }
+        Err(message) => { eprintln!("isohypse: {message}"); std::process::exit(1); }
     }
 }

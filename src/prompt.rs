@@ -1,98 +1,120 @@
-pub const FORMAT_REFERENCE: &str = r#"# isohypse — op grammar v0.1
+pub const HELP: &str = "Isohypse — read, explore, and edit through one persistent session.
 
-Every action is one op object: {"op":"<category.action>","arg":<primary>, ...fields}.
-Categories declare effect: context reads, mutate writes, verify validates; state,
-macro, and session are domains for the daemon and store, saved sequences, and the
-wire. Full spec: isohypse.schema_v0.1.md (JSON Schema in isohypse.schema_v0.1.json).
+Load the grammar first: call context.prompt. Until a session has read it, the
+daemon refuses every other operation.
+Read files to obtain tags; anchor edits to those tags.
+Batch related operations and provide a validation command for edits.
+List saved revisions with context.log; read one with context.read and its tag.
+Use the returned tag for the next edit. Inspect failures before retrying.
+After a disconnect or daemon reload, send session.reconnect alone, then reread
+affected files. Codex and Pi both accept it, and neither needs operator action.
 
-Work in one loop:
-  1. context.read a file -> a [path#TAG] header and numbered N:TEXT rows. TAG
-     anchors every edit to the exact bytes you saw.
-  2. mutate.edit against that tag, anchored by symbol, lines, or block.
-  3. verify.* steps and the multi-op validate gate prove the change. A stale
-     tag is refused or safely 3-way merged, never blindly overwritten.
+The harness owns workspace selection, authentication, and session lifetime.
+";
 
-## Ops
+pub const FORMAT_REFERENCE: &str = r#"# Isohypse
 
-  context.read / context.find / context.explore (two args = call path) /
-  context.log / context.prompt
-  mutate.edit / mutate.create / mutate.undo
-  verify.build / verify.check / verify.diagnose   (checkpoint:true runs mid-transaction)
-  state.status / state.get / state.put / state.up / state.down / state.reload / state.stop
-  macro.save / macro.run / macro.list
-  session.open / session.command / session.cancel / session.reload /
-  session.subscribe / session.close / session.request / session.requests
+Use one persistent session for the task. The harness owns workspace selection,
+authentication, and session lifetime. Send batches to the isohypse tool.
 
-CLI form: isohypse <category> <action> [arg] — op bodies (mutate.edit, multi-op,
-macro.save) arrive as JSON on stdin.
+## Start here
 
-## mutate.edit — anchored edits
+Load the grammar before anything else:
 
-  {"op":"mutate.edit","path":"src/tag.rs","tag":"571a44f","edits":[
-    {"replace":{"symbol":"FULL_TAG_LENGTH"},"with":"pub const FULL_TAG_LENGTH: usize = 32;"},
-    {"replace":{"lines":[10,14]},"with":"    let x = compute();"},
-    {"replace":{"block":42},"with":"fn a() -> u8 { 42 }"},
-    {"insert":{"after":"$"},"body":"fn added() {}"},
-    {"delete":{"symbol":"old_helper"}},
-    {"move":{"to":"src/tag2.rs"}},
-    {"remove":true}
+{"steps":[{"op":"context.prompt"}]}
+
+A session refuses every other operation until it has read the grammar. The
+response documents tags, anchors, ranges, batching, and validation. Read it once
+instead of guessing field names.
+
+
+## Read and explore
+
+{"steps":[
+  {"op":"context.read","arg":"src/main.rs","range":"1-80"},
+  {"op":"context.find","arg":"parse_request","paths":["src"],"max":10},
+  {"op":"context.explore","arg":"parse_request","compact":true}
+]}
+
+- context.read: arg is a file; range is inclusive; outline:true shows structure. Add tag for saved source.
+- context.find: arg is one pattern; paths/langs narrow scope; literal:true matches text literally.
+- context.explore: arg is a symbol query; paths/langs narrow scope; compact/full control detail.
+- context.prompt: returns this reference.
+
+Use workspace-relative paths. Read only the ranges needed. Batch independent
+lookups; wait for results before sending operations that depend on them.
+Reads return [path#TAG] and numbered lines. Keep the tag with the bytes read.
+
+## Saved history
+
+{"steps":[
+  {"op":"context.log","arg":"src/main.rs","max":20},
+  {"op":"context.read","arg":"src/main.rs","tag":"TAG_FROM_HISTORY","range":"1-80"}
+]}
+
+context.log accepts optional arg (exact recorded path), workspace (absolute
+history root), tag (prefix), since/until (inclusive Unix seconds), max (1–200),
+and offset. Use next_offset for another page. Time filters use saved-object mtime,
+not original edit time; old journals do not store per-revision timestamps.
+With a time filter, entries without storage timestamps are excluded.
+
+context.read with tag returns saved, hash-verified source and its original path.
+arg is optional when the tag identifies one path in that workspace. Default
+history reads show at most 120 lines. Only displayed lines count as seen for edits.
+workspace selects retained history only; it never changes live reads or write
+authority. Historical reads never restore files or append to the journal.
+Read the current target before planning restoration; tagged edits and validation
+remain required.
+
+
+## Edit and validate
+
+{"steps":[
+  {"op":"mutate.edit","path":"src/main.rs","tag":"TAG_FROM_READ","edits":[
+    {"replace":{"lines":[10,12]},"with":"replacement text"}
   ]}
+],"validate":"cargo check"}
 
-Anchors: {"symbol":NAME} is preferred — order-independent, no line math.
-{"lines":[A,B]} is inclusive, numbered from your latest read of that tag.
-{"block":N} is the whole construct beginning at line N. Insert anchors:
-{"before":N|"^"} and {"after":N|"$"}. Actions: replace, insert, delete, move,
-remove. "with" and "body" are plain strings holding only the final content.
+Each edit has one action:
+- replace: anchor by {"symbol":"name"}, {"lines":[first,last]}, or {"block":start}; supply with.
+- insert: anchor by {"before":line} or {"after":line}; supply body. Use "^"/"$" for file boundaries.
+- delete: anchor by symbol, inclusive lines, or block.
 
-  mutate.create: {"op":"mutate.create","path":"c.rs","content":"..."}  (fails if it exists)
-  mutate.undo:   {"op":"mutate.undo","path":"c.rs","tag":"<prefix>","recover":false}
+mutate.create uses path and content; it refuses an existing file.
+mutate.delete uses path alone; it refuses a directory and a file the object
+store cannot hold, because the removed text is the only baseline a revert can
+restore from.
+Tags must come from a read. Edit only the region read; prefer symbol anchors
+when replacing a whole definition. Successful edits return the next tag.
 
-## multi-op — the transaction envelope
+Mutations require the host's write grant and a nonempty validation command.
+A failed batch or validation rolls back its managed edits. Validation runs with
+the daemon's OS privileges; arbitrary shell side effects are not transactional.
 
-Ordered steps run atomically; any failed step, failed verify, or failed validate
-reverts every mutation. Any mutate.* step REQUIRES a top-level "validate": a
-shell command, or the literal "none" to waive it deliberately.
+## Failures
 
-  {"op":"multi-op","payload":{
-    "steps":[
-      {"op":"context.read","arg":"a.rs"},
-      {"op":"mutate.edit","path":"a.rs","tag":"tagA","edits":[
-        {"replace":{"symbol":"first"},"with":"fn first() -> u8 { 1 }"}]},
-      {"op":"verify.build","checkpoint":true}
-    ],
-    "validate":"cargo test"
-  }}
+Stale tags are refused or merged against the recorded baseline. Inspect the
+result before continuing. After cancellation or a transport failure, inspect
+current files before submitting a new change; never replay an uncertain edit.
+Acknowledge means accepted, not completed. Use the matching result or error.
 
-CLI: isohypse multi-op reads that payload as JSON on stdin. Results come back
-grouped by effect (context / mutate / verify); execution stays in step order.
+After a disconnect or daemon reload, send this standalone batch:
 
-## Session — open once, run many
+{"steps":[{"op":"session.reconnect"}]}
 
-isohypse session speaks line-delimited JSON both ways:
+Do not combine reconnect with other steps or validation. Codex and Pi both
+accept it, and the agent runs it directly rather than asking the operator. Pi
+keeps the scope already authorized for that session and opens a fresh socket,
+starting the workspace daemon if the old one is gone. It opens a new session
+under the same workspace and grant; it never replays earlier calls. The new
+session has not read the grammar, so call context.prompt again. Afterward read
+affected files before editing. An unconfirmed mutation stays unconfirmed until
+inspected; reconnect does not undo it.
 
-  1. {"do":"session.open","label":"my-agent"}
-     -> {"ch":"ready","session":"my-agent.0007","token":"...","seq":1}
-     Keep the token; reconnect with
-     {"do":"session.open","label":"my-agent","resume":{"session":"my-agent.0007","token":"..."}}
-  2. {"do":"session.command","id":1,"op":"context.read","payload":{"arg":"src/lib.rs"}}
-     -> {"ch":"ack","id":1,...} then {"ch":"result","id":1,"output":"...","json":{...}}
-     You pick each id; replies echo it. Pipeline several — replies may interleave.
-  3. {"do":"session.cancel","id":1}   {"do":"session.reload"}   {"do":"session.close"}
-  4. {"do":"session.subscribe","kinds":["file-changed","index-updated"],"workspaces":[]}
-     -> unsolicited {"ch":"event",...}; a slow reader gets {"ch":"gap","dropped":N}.
+In the Isohypse source workspace, session.reload alone builds, signs, and
+hot-reloads the daemon. It requires a separate host maintenance grant plus the
+write grant; tool arguments cannot grant either. Reconnect afterward.
 
-session.request files a note for other agents; session.requests lists them.
-Every frame carries a global "seq": one ordered timeline across the whole swarm.
-
-## Rules
-
-  - arg is the ONLY primary key. Other fields are named plainly: content,
-    validate, tag, recover, range, outline, max_bytes, checkpoint, name, steps.
-  - Tags come from your latest read; a mutate re-tags the file and the reply
-    prints the new tag. Chain onto it. Prefer symbol anchors: no line math.
-  - Bundle work: one multi-op or one session, never one CLI spawn per step.
-  - On any error, READ THE OUTPUT — it names the cause (stale tag, path outside
-    the workspace, no daemon). Never retry the same call blind.
-  - Ops act on the repo at your cwd; -w '*' fans read-only ops across all live
-    workspaces. --json returns structured output.
+The tool accepts static steps and validate. It does not expose raw jq, workspace
+switching, file moves, file removal, or other lifecycle commands. Do not invent fields.
 "#;

@@ -39,7 +39,13 @@ pub struct GraphIndex {
     pub root: PathBuf,
     pub store: GraphStore,
     extractions: BTreeMap<String, (String, Extraction)>,
-    written: HashMap<String, (String, Vec<EdgeRow>)>,
+    /// Per file: content hash and a digest of its resolved edges. The digest is
+    /// what makes the unchanged check cheap; storing the edges themselves kept a
+    /// second full copy of the edge graph for no benefit.
+    written: HashMap<String, (String, u64)>,
+    /// Files dropped by the size cap. They are absent from every find and
+    /// explore, so the count is kept and reported rather than left implicit.
+    pub oversized_files: usize,
 }
 
 pub fn is_indexable(path: &Path) -> bool {
@@ -47,6 +53,23 @@ pub fn is_indexable(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| INDEXABLE_EXTENSIONS.contains(&e))
         .unwrap_or(false)
+}
+
+// A workspace root is a project directory, never a home directory or the
+// filesystem root: indexing either one walks the whole disk.
+pub fn is_workspace_root(path: &Path) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if canonical.parent().is_none() {
+        return false;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let home = home.canonicalize().unwrap_or(home);
+        if canonical == home {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn load_skipped_directories(root: &Path) -> BTreeSet<String> {
@@ -79,7 +102,7 @@ pub(crate) fn is_virtualenv(dir: &Path) -> bool {
     dir.join(VIRTUALENV_MARKER).is_file()
 }
 
-fn max_indexable_bytes() -> u64 {
+pub fn max_indexable_bytes() -> u64 {
     std::env::var(MAX_INDEXABLE_BYTES_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -114,6 +137,7 @@ fn collect_files(
     dir: &Path,
     skipped: &BTreeSet<String>,
     max_bytes: u64,
+    oversized: &mut usize,
     out: &mut Vec<PathBuf>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -121,22 +145,33 @@ fn collect_files(
     children.sort();
     for child in children {
         let Some(name) = child.file_name().and_then(|n| n.to_str()) else { continue };
-        if symlink_escapes_root(root, &child) {
+        let is_symlink = std::fs::symlink_metadata(&child).map(|meta| meta.file_type().is_symlink()).unwrap_or(true);
+        if is_symlink || symlink_escapes_root(root, &child) {
             continue;
         }
         if child.is_dir() {
             if !skipped.contains(name) && !is_virtualenv(&child) {
-                collect_files(root, &child, skipped, max_bytes, out);
+                collect_files(root, &child, skipped, max_bytes, oversized, out);
             }
-        } else if is_indexable(&child) && within_size_cap(&child, max_bytes) {
-            out.push(child);
+        } else if is_indexable(&child) {
+            if within_size_cap(&child, max_bytes) {
+                out.push(child);
+            } else {
+                *oversized += 1;
+            }
         }
     }
 }
 
 impl GraphIndex {
     pub fn open(root: impl Into<PathBuf>) -> GraphIndex {
-        GraphIndex { root: root.into(), store: GraphStore::new(), extractions: BTreeMap::new(), written: HashMap::new() }
+        GraphIndex {
+            root: root.into(),
+            store: GraphStore::new(),
+            extractions: BTreeMap::new(),
+            written: HashMap::new(),
+            oversized_files: 0,
+        }
     }
 
     fn relative_key(&self, path: &Path) -> String {
@@ -144,57 +179,118 @@ impl GraphIndex {
     }
 
     pub fn full_index(&mut self) -> IndexSummary {
+        self.full_index_cancelable(None).unwrap_or_else(|_| IndexSummary {
+            files: self.extractions.len(),
+            extracted: 0,
+            skipped: 0,
+            oversized: self.oversized_files,
+            symbols: self.store.symbol_count(),
+        })
+    }
+
+    pub fn full_index_cancelable(&mut self, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<IndexSummary, String> {
         let mut files = Vec::new();
+        let mut oversized = 0usize;
         let skipped = load_skipped_directories(&self.root);
-        collect_files(&self.root, &self.root.clone(), &skipped, max_indexable_bytes(), &mut files);
-        let existing = &self.extractions;
-        let root = &self.root;
-        let worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(files.len().max(1));
-        let chunk_size = files.len().div_ceil(worker_count.max(1)).max(1);
-        let mut skipped = 0usize;
-        let fresh: Vec<(String, String, Extraction)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = files
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        let mut out: Vec<(String, String, Extraction)> = Vec::new();
-                        let mut unreadable = 0usize;
-                        for file in chunk {
+        collect_files(&self.root, &self.root.clone(), &skipped, max_indexable_bytes(), &mut oversized, &mut files);
+        self.oversized_files = oversized;
+        let root = self.root.clone();
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1);
+        let cancel = || cancelled.is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire));
+
+        // Pass 1 — extract a batch, hand its symbols to the store, and drop the
+        // extraction. Holding every file's call sites and type references at once
+        // was the resident peak: gigabytes on a large workspace, and it is transient
+        // data, not retained state.
+        let known: BTreeMap<String, String> = self
+            .extractions
+            .iter()
+            .map(|(key, (hash, _))| (key.clone(), hash.clone()))
+            .collect();
+        let mut changed: Vec<String> = Vec::new();
+        let mut unreadable_keys: Vec<String> = Vec::new();
+        for batch in files.chunks(workers * 4) {
+            if cancel() {
+                return Err("reindex cancelled".to_string());
+            }
+            let results: Vec<(String, Option<(String, Extraction)>, bool)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|file| {
+                        let root = &root;
+                        let known = &known;
+                        scope.spawn(move || {
                             let key = relative_key_for(root, file);
                             let Ok(raw) = std::fs::read_to_string(file) else {
-                                unreadable += 1;
-                                continue;
+                                return (key, None, true);
                             };
                             let text = normalize_to_lf(&raw);
                             let hash = full_tag(&text);
-                            if existing.get(&key).map(|(current, _)| current == &hash).unwrap_or(false) {
-                                continue;
+                            if known.get(&key).map(|current| current == &hash).unwrap_or(false) {
+                                return (key, None, false);
                             }
                             let extraction = extract(&key, &text);
-                            out.push((key, hash, extraction));
-                        }
-                        (out, unreadable)
+                            (key, Some((hash, extraction)), false)
+                        })
                     })
-                })
-                .collect();
-            let mut all = Vec::new();
-            for handle in handles {
-                match handle.join() {
-                    Ok((mut out, unreadable)) => {
-                        all.append(&mut out);
-                        skipped += unreadable;
-                    }
-                    Err(_) => eprintln!("index: a worker panicked; its files were skipped"),
+                    .collect();
+                handles.into_iter().filter_map(|handle| handle.join().ok()).collect()
+            });
+            for (key, extracted, unreadable) in results {
+                if unreadable {
+                    unreadable_keys.push(key);
+                    continue;
+                }
+                if let Some((hash, extraction)) = extracted {
+                    self.store.replace_file(&key, &hash, &extraction.symbols, &[]);
+                    // Keep impls: the trait-implementation table is global, everything
+                    // else the extraction carries is per-file and recomputed in pass 2.
+                    self.extractions
+                        .insert(key.clone(), (hash, Extraction { impls: extraction.impls, ..Extraction::default() }));
+                    changed.push(key);
                 }
             }
-            all
-        });
-        let extracted = fresh.len();
-        for (key, hash, extraction) in fresh {
-            self.extractions.insert(key, (hash, extraction));
         }
-        self.write_all();
-        IndexSummary { files: self.extractions.len(), extracted, skipped, symbols: self.store.symbol_count() }
+
+        let skipped_files = unreadable_keys.len();
+        for key in unreadable_keys {
+            self.extractions.remove(&key);
+            self.written.remove(&key);
+            self.store.remove_file(&key);
+        }
+        let discovered: BTreeSet<String> = files.iter().map(|file| relative_key_for(&self.root, file)).collect();
+        let stale: Vec<String> = self.extractions.keys().filter(|key| !discovered.contains(*key)).cloned().collect();
+        for key in stale {
+            self.extractions.remove(&key);
+            self.written.remove(&key);
+            self.store.remove_file(&key);
+        }
+
+        // Pass 2 — the symbol table is now complete, so re-extract each changed file
+        // in batches and resolve only that batch's edges against it.
+        let extracted = changed.len();
+        for batch in changed.chunks(workers * 4) {
+            if cancel() {
+                return Err("reindex cancelled".to_string());
+            }
+            let mut targets: BTreeSet<String> = BTreeSet::new();
+            for key in batch {
+                let Ok(raw) = std::fs::read_to_string(self.root.join(key)) else { continue };
+                let text = normalize_to_lf(&raw);
+                let extraction = extract(key, &text);
+                if let Some(entry) = self.extractions.get_mut(key) {
+                    entry.1.calls = extraction.calls;
+                    entry.1.type_refs = extraction.type_refs;
+                    entry.1.method_edges = extraction.method_edges;
+                    entry.1.impls = extraction.impls;
+                }
+                targets.insert(key.clone());
+            }
+            self.write_all(&targets);
+            self.drop_edge_inputs();
+        }
+
+        Ok(IndexSummary { files: self.extractions.len(), extracted, skipped: skipped_files, oversized, symbols: self.store.symbol_count() })
     }
 
     pub fn update_file(&mut self, path: &Path) {
@@ -211,7 +307,9 @@ impl GraphIndex {
                 {
                     return;
                 }
-                self.extractions.insert(key.clone(), (hash, extract(&key, &text)));
+                let extraction = extract(&key, &text);
+                self.store.replace_file(&key, &hash, &extraction.symbols, &[]);
+                self.extractions.insert(key.clone(), (hash, Extraction { symbols: Vec::new(), ..extraction }));
             }
             Err(_) => {
                 self.extractions.remove(&key);
@@ -219,63 +317,92 @@ impl GraphIndex {
                 self.store.remove_file(&key);
             }
         }
-        self.write_all();
+        let targets: BTreeSet<String> = std::iter::once(key.clone()).collect();
+        self.write_all(&targets);
+        self.drop_edge_inputs();
     }
 
-    fn write_all(&mut self) {
+    /// Edge inputs — call sites, type references, method edges — are only needed
+    /// while resolving that file's edges. Retaining them for every file after the
+    /// edges were stored was the largest resident structure in the index.
+    fn drop_edge_inputs(&mut self) {
+        for (_, (_, extraction)) in self.extractions.iter_mut() {
+            extraction.calls = Vec::new();
+            extraction.calls.shrink_to_fit();
+            extraction.type_refs = Vec::new();
+            extraction.type_refs.shrink_to_fit();
+            extraction.method_edges = Vec::new();
+            extraction.method_edges.shrink_to_fit();
+        }
+    }
+
+    /// Write resolved edges for the given files only. Other files keep the edges
+    /// already in the store, which is what makes a single-file edit cheap.
+    fn write_all(&mut self, targets: &BTreeSet<String>) {
         let edges_by_file = self.resolve_edges();
         let empty: Vec<EdgeRow> = Vec::new();
-        let entries: Vec<(String, String, Vec<SymbolRow>)> = self
-            .extractions
+        let entries: Vec<(String, String)> = targets
             .iter()
-            .map(|(path, (hash, extraction))| (path.clone(), hash.clone(), extraction.symbols.clone()))
+            .filter_map(|path| self.extractions.get(path).map(|(hash, _)| (path.clone(), hash.clone())))
             .collect();
-        for (path, hash, symbols) in entries {
+        for (path, hash) in entries {
             let edges = edges_by_file.get(&path).unwrap_or(&empty);
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                edges.len().hash(&mut hasher);
+                for edge in edges {
+                    edge.src.hash(&mut hasher);
+                    edge.dst.hash(&mut hasher);
+                    edge.kind.hash(&mut hasher);
+                    edge.confidence.hash(&mut hasher);
+                    edge.detail.hash(&mut hasher);
+                }
+                hasher.finish()
+            };
             let unchanged = self
                 .written
                 .get(&path)
-                .map(|(written_hash, written_edges)| written_hash == &hash && written_edges == edges)
+                .map(|(written_hash, written_edges)| written_hash == &hash && *written_edges == digest)
                 .unwrap_or(false);
             if unchanged {
                 continue;
             }
-            self.store.replace_file(&path, &hash, &symbols, edges);
-            self.written.insert(path, (hash, edges.clone()));
+            self.store.set_edges(&path, edges);
+            self.written.insert(path, (hash, digest));
         }
     }
 
-    fn resolve_edges(&self) -> HashMap<String, Vec<EdgeRow>> {
-        let mut fn_by_name: HashMap<&str, Vec<&SymbolRow>> = HashMap::new();
-        let mut by_qualified: HashMap<&str, Vec<&SymbolRow>> = HashMap::new();
-        let mut fn_by_suffix: HashMap<String, Vec<&SymbolRow>> = HashMap::new();
-        let mut symbol_file: HashMap<&str, &str> = HashMap::new();
-        let mut trait_symbols: HashMap<&str, &SymbolRow> = HashMap::new();
-        let mut type_symbols: HashMap<&str, Vec<&SymbolRow>> = HashMap::new();
-        for (_, extraction) in self.extractions.values() {
-            for symbol in &extraction.symbols {
-                symbol_file.insert(&symbol.id, &symbol.file);
-                by_qualified.entry(&symbol.qualified).or_default().push(symbol);
-                match symbol.kind.as_str() {
-                    "fn" => {
-                        fn_by_name.entry(&symbol.name).or_default().push(symbol);
-                        let segments: Vec<&str> = symbol.qualified.rsplit("::").take(2).collect();
-                        if segments.len() == 2 {
-                            fn_by_suffix
-                                .entry(format!("{}::{}", segments[1], segments[0]))
-                                .or_default()
-                                .push(symbol);
-                        }
+    fn resolve_edges<'a>(&'a self) -> HashMap<String, Vec<EdgeRow>> {
+        let mut fn_by_name: HashMap<&'a str, Vec<&'a SymbolRow>> = HashMap::new();
+        let mut by_qualified: HashMap<&'a str, Vec<&'a SymbolRow>> = HashMap::new();
+        let mut fn_by_suffix: HashMap<String, Vec<&'a SymbolRow>> = HashMap::new();
+        let mut symbol_file: HashMap<&'a str, &'a str> = HashMap::new();
+        let mut trait_symbols: HashMap<&'a str, &'a SymbolRow> = HashMap::new();
+        let mut type_symbols: HashMap<&'a str, Vec<&'a SymbolRow>> = HashMap::new();
+        let mut visit = |symbol: &'a SymbolRow| {
+            symbol_file.insert(&symbol.id, &symbol.file);
+            by_qualified.entry(&symbol.qualified).or_default().push(symbol);
+            match symbol.kind.as_str() {
+                "fn" => {
+                    fn_by_name.entry(&symbol.name).or_default().push(symbol);
+                    let segments: Vec<&str> = symbol.qualified.rsplit("::").take(2).collect();
+                    if segments.len() == 2 {
+                        fn_by_suffix
+                            .entry(format!("{}::{}", segments[1], segments[0]))
+                            .or_default()
+                            .push(symbol);
                     }
-                    "trait" => {
-                        trait_symbols.insert(&symbol.name, symbol);
-                    }
-                    "type" => type_symbols.entry(&symbol.name).or_default().push(symbol),
-                    _ => {}
                 }
+                "trait" => {
+                    trait_symbols.insert(&symbol.name, symbol);
+                }
+                "type" => type_symbols.entry(&symbol.name).or_default().push(symbol),
+                _ => {}
             }
-        }
-        let mut trait_impls: HashMap<&str, Vec<&str>> = HashMap::new();
+        };
+        self.store.for_each_symbol(&mut visit);
+        let mut trait_impls: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
         for (_, extraction) in self.extractions.values() {
             for impl_row in &extraction.impls {
                 if let Some(trait_name) = &impl_row.trait_name {
@@ -532,6 +659,8 @@ pub struct IndexSummary {
     pub files: usize,
     pub extracted: usize,
     pub skipped: usize,
+    /// Indexable files left out because they exceed ISOHYPSE_MAX_FILE_BYTES.
+    pub oversized: usize,
     pub symbols: usize,
 }
 

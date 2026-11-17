@@ -56,7 +56,9 @@ pub fn record(session: Option<&str>, entry: Value) {
                 rotate_if_large(&merged, MAX_MERGED_BYTES);
                 append(&merged, &line);
                 if let Some(session) = &msg.session {
-                    append(&dir.join(format!("{}.jsonl", sanitize(session))), &line);
+                    let session_path = dir.join(format!("{}.jsonl", sanitize(session)));
+                    rotate_if_large(&session_path, MAX_MERGED_BYTES);
+                    append(&session_path, &line);
                 }
             }
         });

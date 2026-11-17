@@ -19,6 +19,10 @@ fn sig_path() -> PathBuf {
     store_root().join("manifest.sig")
 }
 
+fn pending_path() -> PathBuf {
+    store_root().join("manifest.pending")
+}
+
 const KEY_FILES: [&str; 3] = ["store.key", "refs/refs.key", "config.json"];
 
 fn manifest_body_at(root: &Path) -> String {
@@ -42,7 +46,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if text.len() % 2 != 0 || !text.is_ascii() {
         return None;
     }
     (0..text.len() / 2)
@@ -53,8 +57,23 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
 pub fn refresh() -> Option<()> {
     let body = manifest_body_at(&store_root());
     let signature = isohypse_se::sign(&key_path(), body.as_bytes())?;
+    let signature = hex_encode(&signature);
+    let pending = serde_json::json!({"body": body, "signature": signature}).to_string();
+    crate::objects::write_private(&pending_path(), pending.as_bytes())?;
     crate::objects::write_private(&manifest_path(), body.as_bytes())?;
-    crate::objects::write_private(&sig_path(), hex_encode(&signature).as_bytes())?;
+    crate::objects::write_private(&sig_path(), signature.as_bytes())?;
+    let _ = std::fs::remove_file(pending_path());
+    Some(())
+}
+
+fn recover_pending() -> Option<()> {
+    let bytes = std::fs::read(pending_path()).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let body = value.get("body")?.as_str()?;
+    let signature = value.get("signature")?.as_str()?;
+    crate::objects::write_private(&manifest_path(), body.as_bytes())?;
+    crate::objects::write_private(&sig_path(), signature.as_bytes())?;
+    let _ = std::fs::remove_file(pending_path());
     Some(())
 }
 
@@ -73,10 +92,10 @@ pub fn check() -> Result<(), String> {
         let Some(rest) = line.strip_prefix("key ") else { continue };
         let mut parts = rest.splitn(2, ' ');
         let (Some(name), Some(recorded_hash)) = (parts.next(), parts.next()) else { continue };
-        if let Ok(bytes) = std::fs::read(store_root().join(name)) {
-            if blake3::hash(&bytes).to_hex().to_string() != recorded_hash {
-                return Err(format!("{name} changed since the store manifest was signed"));
-            }
+        let bytes = std::fs::read(store_root().join(name))
+            .map_err(|_| format!("{name} is missing or unreadable from the signed store"))?;
+        if blake3::hash(&bytes).to_hex().to_string() != recorded_hash {
+            return Err(format!("{name} changed since the store manifest was signed"));
         }
     }
     Ok(())
@@ -127,6 +146,7 @@ pub fn reenable() -> Result<String, String> {
 }
 
 pub fn ensure() -> Result<(), String> {
+    let _ = recover_pending();
     if let Some(reason) = latched_reason() {
         return Err(format!(
             "agent mode disabled: {reason}; re-enable with `isohypse setup --reenable-agent`"
@@ -158,6 +178,7 @@ pub fn ensure() -> Result<(), String> {
     Ok(())
 }
 
+// ── unit: machine manifest ─────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,15 +189,22 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("store.key"), [7u8; 32]).unwrap();
         let body = manifest_body_at(&dir);
-        assert!(body.starts_with("isohypse-manifest v1\n"));
-        assert!(body.contains("key store.key "));
-        assert!(!body.contains("refs/refs.key"));
+        let __ok0: bool = body.starts_with("isohypse-manifest v1\n");
+        let __ok1: bool = body.contains("key store.key ");
+        let __ok2: bool = !body.contains("refs/refs.key");
         let _ = std::fs::remove_dir_all(&dir);
+
+        let failed: Vec<&str> = [(__ok0, "body.starts_with(\"isohypse-manifest v1\\n\")"), (__ok1, "body.contains(\"key store.key \")"), (__ok2, "!body.contains(\"refs/refs.key\")")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
     fn hex_round_trip() {
         let bytes = [0u8, 1, 15, 16, 200, 255];
-        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes.to_vec());
+        let __ok0: bool = (hex_decode(&hex_encode(&bytes)).unwrap()) == (bytes.to_vec());
+        let __ok1: bool = (hex_decode("a\u{e9}b")) == (None);
+
+        let failed: Vec<&str> = [(__ok0, "hex_decode(&hex_encode(&bytes)).unwrap() == bytes.to_vec()"), (__ok1, "non-ASCII text of even byte length must not panic")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

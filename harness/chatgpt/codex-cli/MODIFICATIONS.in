@@ -1,0 +1,13 @@
+Isohypse integration for OpenAI Codex rust-v@@VERSION@@
+
+Modified by the Isohypse project:
+- app-server/src/lib.rs and extensions.rs register the native Isohypse extension.
+- app-server/src/isohypse.rs and isohypse_tests.rs are added by Isohypse.
+- tools/src/tool_call.rs and core/src/tools/handlers/extension_tools.rs expose
+  canonical, persisted file-change items through the host's turn-item emitter.
+- Cargo.lock first-party package versions are normalized to @@VERSION@@.
+
+The code-mode host ships as the unmodified upstream release binary and is not
+rebuilt here; the v8 runtime it alone depends on is therefore never compiled.
+This integration is not an official OpenAI product or endorsement.
+

@@ -159,9 +159,7 @@ pub fn archive_repo(root: &Path) -> Result<(), String> {
         }
     }
     for tag in &own_tags {
-        if tag.len() < 4 {
-            continue;
-        }
+        if tag.len() < 4 { continue; }
         let blob = objects::objects_dir().join(&tag[..2]).join(&tag[2..]);
         let Ok(bytes) = std::fs::read(&blob) else { continue };
         if let Some(entry_name) = relative_name(&store, &blob) {
@@ -169,21 +167,28 @@ pub fn archive_repo(root: &Path) -> Result<(), String> {
         }
         if !foreign_tags.contains(tag) {
             removals.push(blob);
-            removals.push(store.join("seen").join(tag));
+            if let Some(seen) = objects::ObjectStore::seen_path_for(tag) {
+                removals.push(seen);
+            }
         }
     }
     let sealed = pack_entries(&entries).ok_or_else(|| "store key unavailable".to_string())?;
     let dir = inactive_dir();
-    if !ensure_private_dir(&dir) {
-        return Err("cannot create inactive dir".to_string());
-    }
-    objects::write_private(&dir.join(&name), &sealed)
-        .ok_or_else(|| "cannot write lifecycle bundle".to_string())?;
+    if !ensure_private_dir(&dir) { return Err("cannot create inactive dir".to_string()); }
+    objects::write_private(&dir.join(&name), &sealed).ok_or_else(|| "cannot write lifecycle bundle".to_string())?;
+    let mut failed = Vec::new();
     for path in removals {
-        let _ = std::fs::remove_file(path);
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failed.push(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("archive written but cleanup failed: {}", failed.join("; ")));
     }
     objects::forget_workspace(root);
-    objects::runtime_unregister(root);
+    objects::runtime_unregister_if(root, &crate::daemon::socket_path(root));
     Ok(())
 }
 
@@ -210,28 +215,37 @@ pub fn restore(root: &Path) -> bool {
     let Some(bundle) = [inactive_dir().join(&name), cold_dir().join(&name)]
         .into_iter()
         .find(|path| path.is_file())
-    else {
-        return false;
-    };
+    else { return false };
     let Ok(bytes) = std::fs::read(&bundle) else { return false };
     let Some(entries) = unpack_entries(&bytes) else { return false };
     let store = objects::store_dir();
     let mut restored = false;
+    let mut incomplete = false;
     for (entry_name, data) in entries {
-        if entry_name == ROOT_ENTRY || !safe_entry_name(&entry_name) {
+        if entry_name == ROOT_ENTRY { continue; }
+        if !safe_entry_name(&entry_name) {
+            incomplete = true;
             continue;
         }
         let target = store.join(&entry_name);
         if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if std::fs::create_dir_all(parent).is_err() {
+                incomplete = true;
+                continue;
+            }
         }
         if objects::write_private(&target, &data).is_some() {
             restored = true;
+        } else {
+            incomplete = true;
         }
     }
-    if restored {
-        let _ = std::fs::remove_file(&bundle);
-        eprintln!("lifecycle: restored archived state for {}", root.display());
+    if restored && !incomplete {
+        if std::fs::remove_file(&bundle).is_ok() {
+            eprintln!("lifecycle: restored archived state for {}", root.display());
+        }
+    } else if restored {
+        eprintln!("lifecycle: partially restored archived state for {}; recovery bundle retained", root.display());
     }
     restored
 }
@@ -267,6 +281,7 @@ pub fn sweep(is_root_live: &dyn Fn(&Path) -> bool) -> (usize, usize) {
     (archived, demoted)
 }
 
+// ── unit: release lifecycle ────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,14 +295,17 @@ mod tests {
         store.journal_record(&file_key, &tag).expect("journal");
         crate::objects::persist_workspace(&root, true, true);
         archive_repo(&root).expect("archive");
-        assert!(store.journal_entries(&file_key).is_empty());
-        assert!(restore(&root));
-        assert_eq!(store.journal_entries(&file_key), vec![tag.clone()]);
+        let __ok0: bool = store.journal_entries(&file_key).is_empty();
+        let __ok1: bool = restore(&root);
+        let __ok2: bool = (store.journal_entries(&file_key)) == (vec![tag.clone()]);
         let resolved = matches!(
             store.resolve(&tag),
             crate::objects::Resolution::Found(_, content) if content == "fn lifecycle_probe() {}"
         );
-        assert!(resolved);
+        let __ok3: bool = resolved;
         crate::objects::forget_workspace(&root);
+
+        let failed: Vec<&str> = [(__ok0, "store.journal_entries(&file_key).is_empty()"), (__ok1, "restore(&root)"), (__ok2, "store.journal_entries(&file_key) == vec![tag.clone()]"), (__ok3, "resolved")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

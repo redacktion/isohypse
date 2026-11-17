@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "isohypse hook" }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|Edit|MultiEdit|Write|NotebookEdit|Bash",
+        "hooks": [{ "type": "command", "command": "isohypse hook" }]
+      }
+    ]
+  }
+}

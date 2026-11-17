@@ -17,14 +17,28 @@ mod platform {
         ) -> i32;
     }
 
+    /// The designated requirement is fixed for this process, and recomputing it
+    /// on every peer check adds a signing-API round trip to each connection.
     fn self_requirement() -> Option<SecRequirement> {
-        let own = SecCode::for_self(Flags::NONE).ok()?;
-        let mut requirement: core_foundation::base::CFTypeRef = std::ptr::null();
-        let status = unsafe { SecCodeCopyDesignatedRequirement(own.as_CFTypeRef(), 0, &mut requirement) };
-        if status != 0 || requirement.is_null() {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        let raw = *CACHED.get_or_init(|| {
+            let Ok(own) = SecCode::for_self(Flags::NONE) else { return 0 };
+            let mut requirement: core_foundation::base::CFTypeRef = std::ptr::null();
+            let status = unsafe {
+                SecCodeCopyDesignatedRequirement(own.as_CFTypeRef(), 0, &mut requirement)
+            };
+            if status != 0 || requirement.is_null() {
+                return 0;
+            }
+            // Leaked on purpose: the requirement stays valid for the life of the
+            // process, and every caller retains its own reference below.
+            requirement as usize
+        });
+        if raw == 0 {
             return None;
         }
-        Some(unsafe { SecRequirement::wrap_under_create_rule(requirement as _) })
+        Some(unsafe { SecRequirement::wrap_under_get_rule(raw as _) })
     }
 
     fn peer_audit_token(fd: RawFd) -> Option<[u8; 32]> {
@@ -61,6 +75,14 @@ mod platform {
         }
     }
 
+    pub fn process_signature_ok(pid: libc::pid_t) -> bool {
+        let Some(requirement) = self_requirement() else { return false };
+        let mut attrs = GuestAttributes::new();
+        attrs.set_pid(pid);
+        let Ok(code) = SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE) else { return false };
+        code.check_validity(Flags::NONE, &requirement).is_ok()
+    }
+
     pub fn peer_signature_ok(fd: RawFd) -> bool {
         let Some(requirement) = self_requirement() else {
             return no_requirement_ok();
@@ -74,6 +96,8 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 pub use platform::peer_signature_ok;
+#[cfg(target_os = "macos")]
+pub use platform::process_signature_ok;
 
 #[cfg(not(target_os = "macos"))]
 pub fn peer_signature_ok(_fd: std::os::unix::io::RawFd) -> bool {

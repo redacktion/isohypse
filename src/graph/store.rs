@@ -21,9 +21,15 @@ pub struct GraphStore {
     symbols_by_file: BTreeMap<String, Vec<SymbolRow>>,
     edges_by_file: BTreeMap<String, Vec<EdgeRow>>,
     file_hashes: BTreeMap<String, String>,
-    by_id: HashMap<String, SymbolRow>,
+    /// `id -> (file slot, symbol position)`. This held a cloned `SymbolRow`, which
+    /// kept a second full copy of every symbol in the index for no benefit.
+    by_id: HashMap<String, (usize, usize)>,
     by_name: BTreeMap<String, Vec<String>>,
-    edges_into: HashMap<String, Vec<EdgeRow>>,
+    /// `destination id -> (file slot, edge position)`, for the same reason.
+    edges_into: HashMap<String, Vec<(usize, usize)>>,
+    /// Append-only file table, so the maps above hold indices rather than paths.
+    file_slots: HashMap<String, usize>,
+    files_by_slot: Vec<String>,
 }
 
 impl GraphStore {
@@ -35,17 +41,42 @@ impl GraphStore {
         self.file_hashes.get(path).cloned()
     }
 
+    fn file_slot(&mut self, path: &str) -> usize {
+        if let Some(slot) = self.file_slots.get(path) {
+            return *slot;
+        }
+        let slot = self.files_by_slot.len();
+        self.files_by_slot.push(path.to_string());
+        self.file_slots.insert(path.to_string(), slot);
+        slot
+    }
+
+    fn symbol_at(&self, slot: usize, index: usize) -> Option<&SymbolRow> {
+        self.symbols_by_file.get(self.files_by_slot.get(slot)?)?.get(index)
+    }
+
+    fn symbol_ref(&self, id: &str) -> Option<&SymbolRow> {
+        let (slot, index) = *self.by_id.get(id)?;
+        self.symbol_at(slot, index)
+    }
+
+    fn edge_at(&self, slot: usize, index: usize) -> Option<&EdgeRow> {
+        self.edges_by_file.get(self.files_by_slot.get(slot)?)?.get(index)
+    }
+
+
     pub fn replace_file(&mut self, path: &str, content_hash: &str, symbols: &[SymbolRow], edges: &[EdgeRow]) {
         self.drop_file_rows(path);
+        let slot = self.file_slot(path);
         self.file_hashes.insert(path.to_string(), content_hash.to_string());
         self.symbols_by_file.insert(path.to_string(), symbols.to_vec());
         self.edges_by_file.insert(path.to_string(), edges.to_vec());
-        for symbol in symbols {
-            self.by_id.insert(symbol.id.clone(), symbol.clone());
+        for (index, symbol) in symbols.iter().enumerate() {
+            self.by_id.insert(symbol.id.clone(), (slot, index));
             self.by_name.entry(symbol.name.clone()).or_default().push(symbol.id.clone());
         }
-        for edge in edges {
-            self.edges_into.entry(edge.dst.clone()).or_default().push(edge.clone());
+        for (index, edge) in edges.iter().enumerate() {
+            self.edges_into.entry(edge.dst.clone()).or_default().push((slot, index));
         }
     }
 
@@ -57,6 +88,7 @@ impl GraphStore {
     }
 
     fn drop_file_rows(&mut self, path: &str) {
+        let Some(slot) = self.file_slots.get(path).copied() else { return };
         if let Some(old_symbols) = self.symbols_by_file.get(path) {
             for symbol in old_symbols {
                 self.by_id.remove(&symbol.id);
@@ -71,7 +103,7 @@ impl GraphStore {
         if let Some(old_edges) = self.edges_by_file.get(path) {
             for edge in old_edges {
                 if let Some(into) = self.edges_into.get_mut(&edge.dst) {
-                    into.retain(|e| e != edge);
+                    into.retain(|(entry, _)| *entry != slot);
                     if into.is_empty() {
                         self.edges_into.remove(&edge.dst);
                     }
@@ -83,7 +115,7 @@ impl GraphStore {
     pub fn symbols_matching(&self, term: &str, limit: usize) -> Vec<SymbolRow> {
         let mut out: Vec<SymbolRow> = Vec::new();
         if let Some(ids) = self.by_name.get(term) {
-            let mut exact: Vec<&SymbolRow> = ids.iter().filter_map(|id| self.by_id.get(id)).collect();
+            let mut exact: Vec<&SymbolRow> = ids.iter().filter_map(|id| self.symbol_ref(id)).collect();
             exact.sort_by(|a, b| (&a.file, a.start_line).cmp(&(&b.file, b.start_line)));
             out.extend(exact.into_iter().take(limit).cloned());
         }
@@ -108,7 +140,7 @@ impl GraphStore {
     }
 
     pub fn symbol_by_id(&self, id: &str) -> Option<SymbolRow> {
-        self.by_id.get(id).cloned()
+        self.symbol_ref(id).cloned()
     }
 
     pub fn enclosing_symbol(&self, file: &str, line: usize) -> Option<SymbolRow> {
@@ -128,7 +160,8 @@ impl GraphStore {
     }
 
     pub fn edges_into(&self, dst: &str) -> Vec<EdgeRow> {
-        self.edges_into.get(dst).cloned().unwrap_or_default()
+        let Some(entries) = self.edges_into.get(dst) else { return Vec::new() };
+        entries.iter().filter_map(|(slot, index)| self.edge_at(*slot, *index).cloned()).collect()
     }
 
     pub fn file_count(&self) -> usize {
@@ -142,6 +175,36 @@ impl GraphStore {
     pub fn all_symbols(&self) -> Vec<SymbolRow> {
         self.symbols_by_file.values().flatten().cloned().collect()
     }
+
+    /// Visit symbols without cloning them. `all_symbols` collects a full copy,
+    /// which is the wrong shape for a caller that only reads.
+    pub fn for_each_symbol<'a>(&'a self, mut visit: impl FnMut(&'a SymbolRow)) {
+        for symbols in self.symbols_by_file.values() {
+            for symbol in symbols {
+                visit(symbol);
+            }
+        }
+    }
+
+    /// Replace only the resolved edges for a file, leaving its symbols in place.
+    pub fn set_edges(&mut self, path: &str, edges: &[EdgeRow]) {
+        let Some(slot) = self.file_slots.get(path).copied() else { return };
+        if let Some(old) = self.edges_by_file.get(path) {
+            for edge in old {
+                if let Some(into) = self.edges_into.get_mut(&edge.dst) {
+                    into.retain(|(entry, _)| *entry != slot);
+                    if into.is_empty() {
+                        self.edges_into.remove(&edge.dst);
+                    }
+                }
+            }
+        }
+        self.edges_by_file.insert(path.to_string(), edges.to_vec());
+        for (index, edge) in edges.iter().enumerate() {
+            self.edges_into.entry(edge.dst.clone()).or_default().push((slot, index));
+        }
+    }
+
 
     pub fn files(&self) -> impl Iterator<Item = &String> {
         self.file_hashes.keys()

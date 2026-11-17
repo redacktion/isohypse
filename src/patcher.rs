@@ -35,6 +35,7 @@ pub struct ApplyReport {
 pub enum MultiOpAction {
     Applied(ApplyReport),
     Created(String),
+    Deleted { path: String, content: String },
 }
 
 #[derive(Default)]
@@ -44,11 +45,25 @@ pub struct MultiOpLedger {
 
 pub type SharedAnalysisCache = std::sync::Arc<std::sync::Mutex<HashMap<String, std::sync::Arc<Analysis>>>>;
 
+thread_local! {
+    static ACTIVE_CANCEL_TOKEN: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_thread_cancel_token(token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    ACTIVE_CANCEL_TOKEN.with(|active| active.replace(token))
+}
+
+pub(crate) fn thread_cancel_token() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    ACTIVE_CANCEL_TOKEN.with(|active| active.borrow().clone())
+}
+
+
 pub struct Patcher {
     root: PathBuf,
     canonical_root: PathBuf,
     pub objects: ObjectStore,
     analysis_cache: SharedAnalysisCache,
+    cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 pub struct Analysis {
@@ -182,6 +197,7 @@ impl Patcher {
             canonical_root,
             objects: ObjectStore::open()?,
             analysis_cache: cache,
+            cancel_token: ACTIVE_CANCEL_TOKEN.with(|active| active.borrow().clone()),
         })
     }
 
@@ -537,6 +553,11 @@ impl Patcher {
     }
 
     pub fn create(&mut self, path: &str, content: &str) -> Result<String, String> {
+        self.create_with_content(path, content).map(|(summary, _)| summary)
+    }
+
+    /// Returns the exact authored text with the summary, without rereading a mutable path.
+    pub fn create_with_content(&mut self, path: &str, content: &str) -> Result<(String, String), String> {
         self.guard(path)?;
         let key = self.canonical_key(path);
         let absolute = self.absolute(path);
@@ -557,7 +578,35 @@ impl Patcher {
         write_nofollow(&absolute, body.as_bytes()).map_err(|e| format!("cannot write {key}: {e}"))?;
         self.record_applied(&key, &body)?;
         let full = full_tag(&body);
-        Ok(format!("created [{key}#{}]\n", &full[..DISPLAY_TAG_LENGTH]))
+        Ok((format!("created [{key}#{}]\n", &full[..DISPLAY_TAG_LENGTH]), body))
+    }
+
+    pub fn delete(&mut self, path: &str) -> Result<String, String> {
+        self.delete_with_content(path).map(|(summary, _)| summary)
+    }
+
+    /// Returns the removed text with the summary, so a multi-op rollback can put it back.
+    pub fn delete_with_content(&mut self, path: &str) -> Result<(String, String), String> {
+        self.guard(path)?;
+        let key = self.canonical_key(path);
+        let absolute = self.absolute(path);
+        let meta = fs::symlink_metadata(&absolute)
+            .map_err(|_| format!("[{key}] does not exist; mutate.delete removes an existing file"))?;
+        if meta.is_dir() {
+            return Err(format!("[{key}] is a directory; mutate.delete removes files, not trees"));
+        }
+        let content = fs::read_to_string(&absolute).map_err(|e| format!("cannot read {key}: {e}"))?;
+        // The removed text is the only baseline a revert can restore from, so a file
+        // the object store cannot hold is refused rather than deleted unrecoverably.
+        let full = match self.objects.put(&content) {
+            Ok(full) => full,
+            Err(_) => return Err(format!("[{key}] refused: the file exceeds the object-store blob limit, so its baseline is not recoverable and a rollback could not restore it. Reduce the file size or raise ISOHYPSE_MAX_BLOB_BYTES; nothing was removed")),
+        };
+        let all: BTreeSet<usize> = (1..=split_lines(&content).lines.len()).collect();
+        self.objects.record_seen(&full, &all)?;
+        self.objects.journal_record(&absolute.to_string_lossy(), &full)?;
+        fs::remove_file(&absolute).map_err(|e| format!("cannot delete {key}: {e}"))?;
+        Ok((format!("deleted [{key}#{}]\n", &full[..DISPLAY_TAG_LENGTH]), content))
     }
 
 
@@ -575,6 +624,10 @@ impl Patcher {
         self.apply_inner(patch, true)
     }
 
+    pub fn set_cancel_token(&mut self, token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+        self.cancel_token = token;
+    }
+
     pub fn check_edits(&mut self, op: &serde_json::Value) -> Result<ApplyReport, String> {
         let patch = self.compile_edit_op(op)?;
         self.apply_inner(patch, false)
@@ -588,21 +641,14 @@ impl Patcher {
     pub fn apply_patch_verified(&mut self, patch: Patch, verify: Option<&str>) -> Result<ApplyReport, String> {
         let report = self.apply_inner(patch, true)?;
         let Some(command) = verify else { return Ok(report) };
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.root)
-            .output()
-            .map_err(|e| format!("verify command failed to start: {e}"))?;
-        if output.status.success() {
+        let outcome = crate::buildspec::run_command_with_cancel(&self.root, command, "explicit", self.cancel_token.as_deref());
+        if outcome.ok {
             return Ok(report);
         }
-        let mut detail = String::from_utf8_lossy(&output.stdout).into_owned();
-        detail.push_str(&String::from_utf8_lossy(&output.stderr));
         self.revert(&report)?;
         Err(format!(
             "verify command `{command}` failed; every section was reverted to its pre-apply version.\n--- verify output ---\n{}",
-            crate::buildspec::head_tail(&detail)
+            outcome.output
         ))
     }
 
@@ -641,6 +687,14 @@ impl Patcher {
                 MultiOpAction::Applied(report) => self.revert(report)?,
                 MultiOpAction::Created(path) => {
                     let _ = fs::remove_file(self.absolute(path));
+                }
+                MultiOpAction::Deleted { path, content } => {
+                    let absolute = self.absolute(path);
+                    if let Some(parent) = absolute.parent() {
+                        fs::create_dir_all(parent).map_err(|e| format!("cannot restore {}: {e}", parent.display()))?;
+                    }
+                    write_nofollow(&absolute, content.as_bytes()).map_err(|e| format!("cannot restore {path}: {e}"))?;
+                    self.record_applied(path, content)?;
                 }
             }
         }
@@ -818,6 +872,17 @@ impl Patcher {
                 _ => Some(new_full[..DISPLAY_TAG_LENGTH].to_string()),
             };
 
+            // Rollback safety: every staged op records the live file as its
+            // baseline. If that baseline is a hash-only tag (oversized file,
+            // no stored blob), a failed apply would resolve it to nothing and
+            // restore_staged would DELETE the file instead of restoring it.
+            // Refuse to stage edits to such files until a recoverable
+            // baseline strategy exists.
+            if !matches!(self.objects.resolve(&live_full), crate::objects::Resolution::Found(_, _)) {
+                return Err(format!(
+                    "[{key}#{cited}] refused: the file exceeds the object-store blob limit, so its baseline is not recoverable and rollback would be unsafe. Reduce the file size or raise ISOHYPSE_MAX_BLOB_BYTES; nothing was written"
+                ));
+            }
             match &section.file_op {
                 Some(FileOp::Rem) => {
                     working.remove(&key);
@@ -910,6 +975,9 @@ impl Patcher {
     }
 
     fn commit_staged(&mut self, staged_write: &StagedWrite) -> Result<(), String> {
+        if self.cancel_token.as_ref().is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err("command cancelled before filesystem commit".to_string());
+        }
         match &staged_write.op {
             StagedOp::Write { text } => {
                 ensure_within(&self.canonical_root, &staged_write.path)?;
@@ -919,13 +987,13 @@ impl Patcher {
                     fs::create_dir_all(parent)
                         .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
                 }
-                let (written, recorded) = std::thread::scope(|scope| {
-                    let writer = scope.spawn(|| write_shaped(&target, text, &staged_write.shape));
-                    let recorded = self.record_applied(&staged_write.path, text);
-                    (writer.join().expect("write thread panicked"), recorded)
-                });
-                written.map_err(|e| format!("cannot write {}: {e}", staged_write.path))?;
-                recorded
+                write_shaped(&target, text, &staged_write.shape)
+                    .map_err(|e| format!("cannot write {}: {e}", staged_write.path))?;
+                if let Err(error) = self.record_applied(&staged_write.path, text) {
+                    self.restore_staged(&target, staged_write.base_tag.as_deref(), &staged_write.shape)?;
+                    return Err(format!("cannot record {} after writing it: {error}", staged_write.path));
+                }
+                Ok(())
             }
             StagedOp::Move { dest, text } => {
                 ensure_within(&self.canonical_root, &staged_write.path)?;
@@ -942,7 +1010,12 @@ impl Patcher {
                     let _ = fs::remove_file(&dest_abs);
                     return Err(format!("cannot remove {}: {error}", staged_write.path));
                 }
-                self.record_applied(dest, text)
+                if let Err(error) = self.record_applied(dest, text) {
+                    let _ = fs::remove_file(&dest_abs);
+                    self.restore_staged(&self.absolute(&staged_write.path), staged_write.base_tag.as_deref(), &staged_write.shape)?;
+                    return Err(format!("cannot record move to {dest} after writing it: {error}"));
+                }
+                Ok(())
             }
             StagedOp::Remove => {
                 ensure_within(&self.canonical_root, &staged_write.path)?;
@@ -958,6 +1031,28 @@ impl Patcher {
         let all: BTreeSet<usize> = (1..=split_lines(text).lines.len()).collect();
         self.objects.record_seen(&full, &all)?;
         self.objects.journal_record(&self.absolute(path).to_string_lossy(), &full)
+    }
+
+    fn restore_staged(&self, path: &Path, base_tag: Option<&str>, shape: &FileShape) -> Result<(), String> {
+        let Some(tag) = base_tag else {
+            // No recorded baseline: the file did not exist before this
+            // session, so removal is the correct restore.
+            return fs::remove_file(path)
+                .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+                .map_err(|e| format!("cannot remove unrecorded {}: {e}", path.display()));
+        };
+        let content = match self.objects.resolve(tag) {
+            crate::objects::Resolution::Found(_, content) => content,
+            _ => {
+                // A recorded baseline that cannot be resolved must never be
+                // treated as "no base": that path deletes the file.
+                return Err(format!(
+                    "cannot restore {}: baseline #{:.16} is recorded but not recoverable from the object store; refusing to delete",
+                    path.display(), tag
+                ));
+            }
+        };
+        write_shaped(path, &content, shape).map_err(|e| format!("cannot restore {}: {e}", path.display()))
     }
 }
 
@@ -1112,4 +1207,40 @@ fn line_shift_map(edits: &[crate::apply::LineEdit]) -> Vec<(usize, i64)> {
         out.push((after_old_line, cumulative));
     }
     out
+}
+#[cfg(test)]
+mod snapshot_safety_tests {
+    use super::*;
+    #[test]
+    fn large_ranged_read_preserves_rollback_and_undo() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("isohypse-large-snapshot-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("large.txt");
+        let original = format!("before\n{}", "snapshot padding\n".repeat(70000));
+        let __ok0: bool = original.len() > 1024 * 1024;
+        fs::write(&path, &original).unwrap();
+        let mut patcher = Patcher::new(&root).unwrap();
+        let read = patcher.read_with("large.txt", Some(1), Some(1), false, None).unwrap();
+        let __ok1: bool = read.contains("1:before\n") && read.len() < 1024;
+        let tag = full_tag(&original);
+        let __ok2: bool = matches!(patcher.objects.resolve(&tag), Resolution::Found(_, body) if body == original);
+        let edit = serde_json::json!({"op":"mutate.edit", "path":"large.txt", "tag":tag,
+            "edits":[{"replace":{"lines":[1,1]},"with":"after"}]});
+        let error = patcher.apply_edits_verified(&edit, Some("false")).unwrap_err();
+        let __ok3: bool = error.contains("reverted");
+        let __ok4: bool = (fs::read_to_string(&path).unwrap()) == (original);
+        patcher.apply_edits_verified(&edit, None).unwrap();
+        let __ok5: bool = fs::read_to_string(&path).unwrap().starts_with("after\n");
+        patcher.undo_with("large.txt", Some(&tag), false).unwrap();
+        let __ok6: bool = (fs::read_to_string(&path).unwrap()) == (original);
+        let missing = "0".repeat(32);
+        let shape = FileShape { bom: String::new(), ending: LineEnding::Lf };
+        let __ok7: bool = patcher.restore_staged(&path, Some(&missing), &shape).is_err();
+        let __ok8: bool = (fs::read_to_string(&path).unwrap()) == (original);
+        fs::remove_dir_all(root).unwrap();
+
+        let failed: Vec<&str> = [(__ok0, "original.len() > 1024 * 1024"), (__ok1, "read.contains(\"1:before\\n\") && read.len() < 1024"), (__ok2, "matches!(patcher.objects.resolve(&tag), Resolution::Found(_, body) if "), (__ok3, "{error}"), (__ok4, "fs::read_to_string(&path).unwrap() == original"), (__ok5, "fs::read_to_string(&path).unwrap().starts_with(\"after\\n\")"), (__ok6, "fs::read_to_string(&path).unwrap() == original"), (__ok7, "patcher.restore_staged(&path, Some(&missing), &shape).is_err()"), (__ok8, "fs::read_to_string(&path).unwrap() == original")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    }
 }

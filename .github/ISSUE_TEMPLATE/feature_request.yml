@@ -77,7 +77,7 @@ body:
       label: Proposed harness extension or hook
       description: If this targets the harness surface (harness/<name>/extensions or hook-extension), sketch it here.
       value: |
-        Harness (pi / codex / CC / OMP / other):
+        Harness (pi / codex / claude / oh-mi-pi / other):
         Type (extension / hook):
         What it does:
         How it makes the model reach for isohypse over the built-in tools:

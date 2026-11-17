@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use stack_graphs::{CancelAfterDuration, CancellationError, CancellationFlag};
 use stack_graphs::arena::Handle;
@@ -16,10 +16,11 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 const WALK_SKIP_DIRS: &[&str] = &["target", "node_modules", "__pycache__", "build", "dist", "vendor"];
-const WALK_BUDGET: usize = 40_000;
 const FILE_BYTE_LIMIT: usize = 1_000_000;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const REFRESH_DEBOUNCE: Duration = Duration::from_secs(10);
+// Semantic index threads recurse through the parse tree.
+const REFS_STACK_BYTES: usize = 64 * 1024 * 1024;
 const STITCH_BUDGET_SECS_ENV: &str = "ISOHYPSE_REFS_BUDGET_SECS";
 const DEFAULT_STITCH_BUDGET_SECS: u64 = 60;
 
@@ -72,14 +73,9 @@ fn collect_sources(root: &Path) -> Vec<SourceFile> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let skipped = crate::graph::resolve::load_skipped_directories(root);
-    let mut budget = WALK_BUDGET;
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
-            if budget == 0 {
-                return out;
-            }
-            budget -= 1;
             let Ok(file_type) = entry.file_type() else { continue };
             if file_type.is_symlink() {
                 continue;
@@ -261,17 +257,12 @@ fn build_callers(sources: &[SourceFile]) -> HashMap<(String, usize), Vec<(String
 
 fn source_fingerprint(root: &Path) -> Fingerprint {
     let mut count = 0usize;
-    let mut newest = 0u128;
+    let mut hasher = blake3::Hasher::new();
     let mut stack = vec![root.to_path_buf()];
-    let mut budget = WALK_BUDGET;
     let skipped = crate::graph::resolve::load_skipped_directories(root);
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
-            if budget == 0 {
-                return (count, newest);
-            }
-            budget -= 1;
             let Ok(file_type) = entry.file_type() else { continue };
             if file_type.is_symlink() {
                 continue;
@@ -290,14 +281,18 @@ fn source_fingerprint(root: &Path) -> Fingerprint {
                 continue;
             }
             count += 1;
-            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
-                if let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) {
-                    newest = newest.max(elapsed.as_nanos());
+            if let Ok(text) = std::fs::read(entry.path()) {
+                if let Ok(relative) = entry.path().strip_prefix(root) {
+                    hasher.update(relative.to_string_lossy().as_bytes());
                 }
+                hasher.update(&text);
             }
         }
     }
-    (count, newest)
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    (count, u128::from_le_bytes(bytes))
 }
 
 type CallerMap = HashMap<(String, usize), Vec<(String, usize)>>;
@@ -420,7 +415,8 @@ impl PreciseIndex {
         let callers = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&callers);
         let notify_slot = Arc::clone(&callers);
-        std::thread::spawn(move || refresh_loop(root, slot));
+        let builder = std::thread::Builder::new().name("precise-refs".into()).stack_size(REFS_STACK_BYTES);
+        let _ = builder.spawn(move || refresh_loop(root, slot));
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if notify_slot.lock().map(|guard| guard.is_some()).unwrap_or(false) {

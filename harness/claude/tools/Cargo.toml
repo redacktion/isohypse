@@ -1,0 +1,27 @@
+[package]
+name = "claude-tools"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: keep this crate out of any ancestor cargo workspace.
+[workspace]
+
+[lib]
+name = "claude_tools"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "prepare"
+path = "src/bin/prepare.rs"
+
+[[bin]]
+name = "install"
+path = "src/bin/install.rs"
+
+[[bin]]
+name = "test-native"
+path = "src/bin/test_native.rs"

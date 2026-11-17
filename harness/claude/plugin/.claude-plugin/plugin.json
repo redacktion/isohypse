@@ -1,0 +1,5 @@
+{
+  "name": "isohypse",
+  "version": "0.3.0",
+  "description": "Briefs the agent and routes Read, Grep, Glob, Edit, Write, and equivalent shell commands through Isohypse in workspaces it serves. Uses only the Bash tool and PreToolUse hooks, so it works with any Claude Code version."
+}

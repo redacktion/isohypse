@@ -129,12 +129,13 @@ fn slice_range(text: &str, range: Range, op_line: usize, description: &str) -> R
     Ok(lines[range.start - 1..range.end].iter().map(|l| l.to_string()).collect())
 }
 
-fn touched_original_lines(op: &ConcreteOp) -> Vec<usize> {
+fn touched_original_lines(op: &ConcreteOp, line_count: usize) -> Vec<usize> {
     match op {
         ConcreteOp::Replace { range, .. } | ConcreteOp::Delete { range } => (range.start..=range.end).collect(),
         ConcreteOp::Insert { gap, .. } => match gap {
             Gap::Before(line) | Gap::After(line) => vec![*line],
-            Gap::Bof | Gap::Eof => Vec::new(),
+            Gap::Bof => vec![1],
+            Gap::Eof => vec![line_count.max(1)],
         },
     }
 }
@@ -151,7 +152,7 @@ fn materialize(
 
     let mut deleted: HashMap<usize, usize> = HashMap::new();
     for sourced in ops {
-        for anchor in touched_original_lines(&sourced.op) {
+        for anchor in touched_original_lines(&sourced.op, line_count) {
             if anchor < 1 || anchor > line_count {
                 return Err(err(sourced.line, format!(
                     "line {anchor} does not exist (file has {line_count} lines)"

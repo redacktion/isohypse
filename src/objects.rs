@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -100,9 +100,12 @@ pub enum Resolution {
     Missing,
 }
 
-const DEFAULT_MAX_BLOB_BYTES: u64 = 1024 * 1024;
+// ponytail: bounded 8 MiB snapshots; raise ISOHYPSE_MAX_BLOB_BYTES for larger sources.
+const DEFAULT_MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024;
 
 fn default_root() -> PathBuf {
+    #[cfg(test)]
+    crate::test_store::isolate();
     if let Ok(overridden) = std::env::var("ISOHYPSE_STORE") {
         return PathBuf::from(overridden);
     }
@@ -125,10 +128,11 @@ const JOURNAL_SEAL_CTX: &str = "isohypse journal seal v1";
 const SEEN_NAME_CTX: &str = "isohypse seen name v1";
 
 static STORE_KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let staging = path.with_extension(format!("tmp.{}", std::process::id()));
+    let staging = path.with_extension(format!("tmp.{}.{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -306,6 +310,17 @@ pub fn runtime_register(root: &std::path::Path, socket: &std::path::Path) -> Res
     write_private(&dir.join(key), &sealed).ok_or_else(|| "cannot write runtime entry".to_string())
 }
 
+pub fn runtime_unregister_if(root: &std::path::Path, expected_socket: &std::path::Path) {
+    let dir = runtime_dir();
+    let Some(key) = opaque_name(RUNTIME_NAME_CTX, &root.to_string_lossy()) else { return };
+    let path = dir.join(key);
+    let Ok(bytes) = fs::read(&path) else { return };
+    let Some(plain) = open_bytes(RUNTIME_SEAL_CTX, &bytes) else { return };
+    let Some((_, socket)) = runtime_entry_from_text(&String::from_utf8_lossy(&plain)) else { return };
+    if socket == expected_socket {
+        let _ = fs::remove_file(path);
+    }
+}
 pub fn runtime_unregister(root: &std::path::Path) {
     let dir = runtime_dir();
     if let Some(key) = opaque_name(RUNTIME_NAME_CTX, &root.to_string_lossy()) {
@@ -478,12 +493,12 @@ fn decode_list(raw: &str) -> Vec<String> {
 
 const SESSIONS_NAME_CTX: &str = "isohypse sessions name v1";
 
-pub fn persist_session(session: &PersistedSession) {
+pub fn persist_session(session: &PersistedSession) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let dir = sessions_dir();
-    let _ = fs::create_dir_all(&dir);
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    let Some(key) = opaque_name(SESSIONS_NAME_CTX, &session.id) else { return };
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create session store: {e}"))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| format!("cannot protect session store: {e}"))?;
+    let key = opaque_name(SESSIONS_NAME_CTX, &session.id).ok_or_else(|| "cannot derive session name".to_string())?;
     let entry = format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         session.id,
@@ -495,8 +510,9 @@ pub fn persist_session(session: &PersistedSession) {
         session.token_hash,
     );
     reap_stale_sessions(&dir);
-    let Some(sealed) = seal_bytes(SESSIONS_SEAL_CTX, entry.as_bytes()) else { return };
-    let _ = write_private(&dir.join(key), &sealed);
+    let sealed = seal_bytes(SESSIONS_SEAL_CTX, entry.as_bytes()).ok_or_else(|| "cannot seal session".to_string())?;
+    write_private(&dir.join(key), &sealed).ok_or_else(|| "cannot persist session".to_string())?;
+    Ok(())
 }
 
 const SESSION_TTL_SECS: u64 = 3 * 24 * 60 * 60;
@@ -600,9 +616,9 @@ fn decode_object(bytes: &[u8]) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-pub fn compact_objects() -> (usize, u64, usize) {
+pub fn compact_objects() -> usize {
     if store_key().is_none() {
-        return (0, 0, 0);
+        return 0;
     }
     let mut reaped = 0usize;
     let objects = default_root().join("objects");
@@ -634,7 +650,7 @@ pub fn compact_objects() -> (usize, u64, usize) {
             }
         }
     }
-    (0, 0, reaped)
+    reaped
 }
 
 const STORE_SCHEMA_VERSION: u32 = 1;
@@ -829,8 +845,18 @@ impl ObjectStore {
         decode_object(&bytes)
     }
 
+    /// Storage timestamp only: legacy journals do not retain per-revision times.
+    pub fn saved_at_unix(&self, full: &str) -> Option<u64> {
+        fs::metadata(self.object_path(full)?).ok()?.modified().ok()?
+            .duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+    }
+
     fn seen_path(&self, full: &str) -> Option<PathBuf> {
         Some(self.root.join("seen").join(opaque_name(SEEN_NAME_CTX, full)?))
+    }
+
+    pub fn seen_path_for(full: &str) -> Option<PathBuf> {
+        Some(default_root().join("seen").join(opaque_name(SEEN_NAME_CTX, full)?))
     }
     const IDX_CTX: &'static str = "isohypse object index seal v1";
 
@@ -922,7 +948,10 @@ impl ObjectStore {
     pub fn put(&self, content: &str) -> Result<String, String> {
         let full = full_tag(content);
         if content.len() as u64 > max_blob_bytes() {
-            return Ok(full);
+            return Err(format!(
+                "object exceeds the internal storage limit of {} bytes; use a bounded range or streaming output",
+                max_blob_bytes()
+            ));
         }
         let path = self.object_path(&full).ok_or_else(|| "store key unavailable".to_string())?;
         let matches_existing = self
@@ -934,7 +963,7 @@ impl ObjectStore {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let encoded = encode_object(content).ok_or_else(|| "store key unavailable".to_string())?;
-            let staging = path.with_extension(format!("tmp.{}", std::process::id()));
+            let staging = path.with_extension(format!("tmp.{}.{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
             fs::write(&staging, &encoded).map_err(|e| e.to_string())?;
             fs::rename(&staging, &path).map_err(|e| e.to_string())?;
             self.index_append(&full);
@@ -999,10 +1028,12 @@ impl ObjectStore {
     }
 
     pub fn record_seen(&self, full: &str, lines: &BTreeSet<usize>) -> Result<(), String> {
+        static SEEN_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SEEN_WRITE.lock().map_err(|_| "seen-lines lock poisoned".to_string())?;
         let mut merged = self.seen_lines(full).unwrap_or_default();
         merged.merge_set(lines);
         let path = self.seen_path(full).ok_or_else(|| "store key unavailable".to_string())?;
-        fs::write(path, merged.serialize()).map_err(|e| e.to_string())
+        write_private(&path, merged.serialize().as_bytes()).ok_or_else(|| "cannot write seen lines".to_string())
     }
 
     pub fn seen_lines(&self, full: &str) -> Option<SeenRanges> {
@@ -1052,6 +1083,7 @@ impl ObjectStore {
     }
 }
 
+// ── unit: object store, journal, and sealed metadata ───────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1061,26 +1093,29 @@ mod tests {
         let root = std::env::temp_dir().join(format!("iso-persist-{}", std::process::id()));
         persist_workspace(&root, true, false);
         let found = persisted_workspaces(3 * 24 * 60 * 60);
-        assert!(
-            found.iter().any(|(r, lsp, sem)| r == &root && *lsp && !*sem),
-            "persisted entry present"
-        );
+        let __ok0: bool = found.iter().any(|(r, lsp, sem)| r == &root && *lsp && !*sem);
         forget_workspace(&root);
         let after = persisted_workspaces(3 * 24 * 60 * 60);
-        assert!(!after.iter().any(|(r, _, _)| r == &root), "forgotten entry gone");
+        let __ok1: bool = !after.iter().any(|(r, _, _)| r == &root);
+
+        let failed: Vec<&str> = [(__ok0, "persisted entry present"), (__ok1, "forgotten entry gone")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
     fn sealed_roundtrip() {
         let key = [7u8; 32];
         let sealed = seal_with(&key, b"store metadata").unwrap();
-        assert_ne!(&sealed[13..], b"store metadata".as_slice());
-        assert_eq!(open_with(&key, &sealed).unwrap(), b"store metadata");
-        assert!(open_with(&[8u8; 32], &sealed).is_none());
+        let __ok0: bool = (&sealed[13..]) != (b"store metadata".as_slice());
+        let __ok1: bool = (open_with(&key, &sealed).unwrap()) == (b"store metadata");
+        let __ok2: bool = open_with(&[8u8; 32], &sealed).is_none();
         let mut tampered = sealed.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
-        assert!(open_with(&key, &tampered).is_none());
+        let __ok3: bool = open_with(&key, &tampered).is_none();
+
+        let failed: Vec<&str> = [(__ok0, "&sealed[13..] != b\"store metadata\".as_slice()"), (__ok1, "open_with(&key, &sealed).unwrap() == b\"store metadata\""), (__ok2, "open_with(&[8u8; 32], &sealed).is_none()"), (__ok3, "open_with(&key, &tampered).is_none()")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     fn temp_store() -> ObjectStore {
@@ -1095,17 +1130,19 @@ mod tests {
 
     #[test]
     fn index_resolves_by_prefix() {
+        let mut failed: Vec<String> = Vec::new();
         let store = temp_store();
         let full = store.put("fn alpha() {}\n").unwrap();
-        assert!(store.index_tags().contains(&full), "index missing tag");
+        { let ok: bool = store.index_tags().contains(&full); if !ok { failed.push("index missing tag".to_string()); } };
         match store.resolve(&full[..8]) {
             Resolution::Found(found, content) => {
-                assert_eq!(found, full);
-                assert_eq!(content, "fn alpha() {}\n");
+                { let ok: bool = (found) == (full); if !ok { failed.push("found == full".to_string()); } };
+                { let ok: bool = (content) == ("fn alpha() {}\n"); if !ok { failed.push("content == \"fn alpha() {{}}\\n\"".to_string()); } };
             }
             _ => panic!("prefix should resolve to the stored object"),
         }
-        assert!(matches!(store.resolve(&full), Resolution::Found(_, _)));
+        { let ok: bool = matches!(store.resolve(&full), Resolution::Found(_, _)); if !ok { failed.push("matches!(store.resolve(&full), Resolution::Found(_, _))".to_string()); } };
+        assert_eq!(failed, Vec::<String>::new(), "these checks failed");
     }
 
     #[test]
@@ -1114,11 +1151,14 @@ mod tests {
         let one = store.put("one\n").unwrap();
         let two = store.put("two\n").unwrap();
         let _ = fs::remove_file(store.index_path());
-        assert!(store.index_tags().is_empty(), "index file not cleared");
+        let __ok0: bool = store.index_tags().is_empty();
         store.rebuild_index();
         let tags = store.index_tags();
-        assert!(tags.contains(&one), "missing one");
-        assert!(tags.contains(&two), "missing two");
+        let __ok1: bool = tags.contains(&one);
+        let __ok2: bool = tags.contains(&two);
+
+        let failed: Vec<&str> = [(__ok0, "index file not cleared"), (__ok1, "missing one"), (__ok2, "missing two")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
@@ -1129,8 +1169,11 @@ mod tests {
         let before = fs::read(&path).unwrap()[0];
         reseal_objects(&store);
         let after = fs::read(&path).unwrap()[0];
-        assert_eq!(before, after, "reseal is idempotent under unchanged config");
-        assert_eq!(store.read_object(&full).unwrap(), "secret body\n");
+        let __ok0: bool = (before) == (after);
+        let __ok1: bool = (store.read_object(&full).unwrap()) == ("secret body\n");
+
+        let failed: Vec<&str> = [(__ok0, "reseal is idempotent under unchanged config"), (__ok1, "store.read_object(&full).unwrap() == \"secret body\\n\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
@@ -1138,8 +1181,11 @@ mod tests {
         let config = crate::setup::Config::load();
         let blob = seal_bytes(OBJECTS_SEAL_CTX, b"hello").unwrap();
         let expected = if config.encrypt_objects { SEAL_VERSION } else { PLAIN_VERSION };
-        assert_eq!(blob[0], expected, "object seal format must follow config");
-        assert_eq!(open_bytes(OBJECTS_SEAL_CTX, &blob).unwrap(), b"hello");
+        let __ok0: bool = (blob[0]) == (expected);
+        let __ok1: bool = (open_bytes(OBJECTS_SEAL_CTX, &blob).unwrap()) == (b"hello");
+
+        let failed: Vec<&str> = [(__ok0, "object seal format must follow config"), (__ok1, "open_bytes(OBJECTS_SEAL_CTX, &blob).unwrap() == b\"hello\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
@@ -1150,11 +1196,14 @@ mod tests {
         set_enc_override(Some(on));
         let full = store.put("secret body\n").unwrap();
         let path = store.object_path(&full).unwrap();
-        assert_eq!(fs::read(&path).unwrap()[0], SEAL_VERSION, "sealed while on");
+        let __ok0: bool = (fs::read(&path).unwrap()[0]) == (SEAL_VERSION);
         set_enc_override(Some(off));
         reseal_objects(&store);
-        assert_eq!(fs::read(&path).unwrap()[0], PLAIN_VERSION, "plaintext after toggling off");
-        assert_eq!(store.read_object(&full).unwrap(), "secret body\n");
+        let __ok1: bool = (fs::read(&path).unwrap()[0]) == (PLAIN_VERSION);
+        let __ok2: bool = (store.read_object(&full).unwrap()) == ("secret body\n");
         set_enc_override(None);
+
+        let failed: Vec<&str> = [(__ok0, "sealed while on"), (__ok1, "plaintext after toggling off"), (__ok2, "store.read_object(&full).unwrap() == \"secret body\\n\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

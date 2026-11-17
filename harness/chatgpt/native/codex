@@ -1,0 +1,4 @@
+#!/bin/sh
+# CODEX_CLI_PATH entrypoint. launch-app.mjs supplies an absolute Node runtime.
+: "${ISOHYPSE_NODE:?Launch through harness/chatgpt/native/launch-app.mjs}"
+exec "$ISOHYPSE_NODE" "$(dirname "$0")/cli.mjs" "$@"
