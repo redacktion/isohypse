@@ -74,6 +74,7 @@ pub enum Builtin {
     MultiEdit,
     Write,
     NotebookEdit,
+    ApplyPatch,
 }
 
 impl Builtin {
@@ -86,6 +87,7 @@ impl Builtin {
             "MultiEdit" => Builtin::MultiEdit,
             "Write" => Builtin::Write,
             "NotebookEdit" => Builtin::NotebookEdit,
+            "apply_patch" => Builtin::ApplyPatch,
             _ => return None,
         })
     }
@@ -93,13 +95,16 @@ impl Builtin {
 
 impl fmt::Display for Builtin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Builtin::ApplyPatch => write!(f, "apply_patch"),
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tool {
-    Builtin { tool: Builtin, target: Option<String> },
+    Builtin { tool: Builtin, targets: Vec<String> },
     Shell(String),
     Other,
 }
@@ -124,15 +129,37 @@ pub fn parse_event(input: &str) -> Option<Event> {
             None => Tool::Other,
         }
     } else if let Some(tool) = Builtin::parse(name) {
-        let target = tool_input
+        let mut targets: Vec<String> = tool_input
             .and_then(|i| i.get("file_path").or_else(|| i.get("path")).or_else(|| i.get("notebook_path")))
             .and_then(Value::as_str)
-            .map(str::to_string);
-        Tool::Builtin { tool, target }
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        if tool == Builtin::ApplyPatch {
+            tool_input.into_iter().for_each(|input| patch_paths(input, &mut targets));
+        }
+        Tool::Builtin { tool, targets }
     } else {
         Tool::Other
     };
     Some(Event::ToolUse { cwd, tool })
+}
+
+/// File paths named by the headers of an apply_patch body, in any string field.
+fn patch_paths(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            const HEADERS: [&str; 4] = ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
+            for line in text.lines() {
+                if let Some(path) = HEADERS.iter().find_map(|h| line.strip_prefix(h)) {
+                    out.push(path.trim().to_string());
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| patch_paths(v, out)),
+        Value::Object(map) => map.values().for_each(|v| patch_paths(v, out)),
+        _ => {}
+    }
 }
 
 // ── shell syntax ───────────────────────────────────────────────────────────
@@ -371,8 +398,8 @@ pub fn decide(event: &Event, probe: &dyn Probe) -> Verdict {
             Some(why) => Verdict::Deny(format!("This workspace is served by Isohypse. {why} Run `{CALL_EXAMPLE}`; `isohypse context prompt` prints the grammar.")),
             None => Verdict::Allow,
         },
-        Event::ToolUse { tool: Tool::Builtin { tool, target }, .. } => {
-            if target.as_deref().is_some_and(|path| !scope.inside(path)) {
+        Event::ToolUse { tool: Tool::Builtin { tool, targets }, .. } => {
+            if !targets.is_empty() && targets.iter().all(|path| !scope.inside(path)) {
                 return Verdict::Allow;
             }
             Verdict::Deny(format!(

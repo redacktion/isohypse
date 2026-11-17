@@ -1,0 +1,14 @@
+{
+  "name": "isohypse",
+  "version": "0.3.1",
+  "description": "Briefs the agent and routes apply_patch and equivalent shell commands through Isohypse in workspaces it serves. Uses only the shell tool and hooks, so it works with any Codex version.",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["isohypse", "code-intelligence", "edit"],
+  "interface": {
+    "displayName": "Isohypse",
+    "shortDescription": "Tagged reads and edits through isohypse call",
+    "longDescription": "Inside a repository served by an Isohypse daemon, edits and file reads go through isohypse call. The hook briefs the agent at session start and denies apply_patch and shell commands that bypass it.",
+    "category": "Developer Tools",
+    "capabilities": ["Hooks"]
+  }
+}

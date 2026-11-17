@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v isohypse >/dev/null 2>&1 && exec isohypse hook || exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v isohypse >/dev/null 2>&1 && exec isohypse hook || exit 0",
+            "timeout": 10,
+            "statusMessage": "Checking whether Isohypse serves this workspace..."
+          }
+        ]
+      }
+    ]
+  }
+}

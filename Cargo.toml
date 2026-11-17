@@ -1,6 +1,6 @@
 [package]
 name = "isohypse"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Agent-first, session-based code substrate: verified tag-anchored reads and edits with a live caller and blast-radius index over a warm in-memory daemon."
 license = "MIT OR Apache-2.0"

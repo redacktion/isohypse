@@ -55,7 +55,21 @@ Or add the hook to `~/.claude/settings.json`:
 
 The agent then uses the Bash tool for `isohypse call`. Allow it without a prompt with the permission rule `Bash(isohypse:*)`.
 
-## Codex and other agents
+## Codex
+
+Install the plugin from this repository's marketplace:
+
+```bash
+codex plugin marketplace add /absolute/path/to/isohypse
+```
+
+```bash
+codex plugin add isohypse@isohypse
+```
+
+The plugin ships the same hooks as the Claude Code plugin. It briefs the agent at session start and denies `apply_patch` and equivalent shell commands in a served workspace. Codex asks you to review and trust plugin hooks before they run.
+
+## Other agents
 
 Put this in `AGENTS.md` (or the agent's equivalent instructions file):
 

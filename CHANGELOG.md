@@ -2,6 +2,17 @@
 
 All notable changes to Isohypse are documented here.
 
+## [0.3.1] - 2026-11-17
+
+### Added
+
+- Codex plugin in `harness/codex/plugin`, with a local marketplace manifest.
+- `isohypse hook` handles Codex `apply_patch`.
+
+### Changed
+
+- Removed the version-pinned native Claude Code and Codex adapters. Use the plugins.
+
 ## [0.3.0] - 2026-11-17
 
 ### Added

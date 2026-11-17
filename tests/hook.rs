@@ -56,6 +56,10 @@ fn tool_event(tool: &str, cwd: &str, input: Value) -> String {
     json!({"tool_name": tool, "cwd": cwd, "tool_input": input}).to_string()
 }
 
+fn patch(text: &str) -> String {
+    tool_event("apply_patch", ROOT, json!({"input": text}))
+}
+
 fn bash(command: &str) -> String {
     tool_event("Bash", ROOT, json!({"command": command}))
 }
@@ -85,10 +89,15 @@ fn builtin_tools_inside_the_workspace_are_denied() {
         ("Glob without path", tool_event("Glob", ROOT, json!({"pattern": "*.rs"}))),
         ("Read through a symlink alias", file("Read", "/alias/lib.rs")),
         ("Read with a relative path", file("Read", "src/a.rs")),
+        ("apply_patch updating a workspace file", patch("*** Begin Patch\n*** Update File: /repo/lib.rs\n@@\n-a\n+b\n*** End Patch")),
+        ("apply_patch adding a relative file", patch("*** Begin Patch\n*** Add File: src/new.rs\n+x\n*** End Patch")),
+        ("apply_patch naming one file outside and one inside", patch("*** Update File: /outside/x.txt\n*** Update File: /repo/lib.rs")),
+        ("apply_patch with no recognizable path", patch("garbage")),
     ]);
     assert_eq!(got, expect(&[
         ("Read", true), ("Edit", true), ("MultiEdit", true), ("Write new file", true), ("NotebookEdit", true),
-        ("Grep without path", true), ("Glob without path", true), ("Read through a symlink alias", true), ("Read with a relative path", true),
+        ("Grep without path", true), ("Glob without path", true), ("Read through a symlink alias", true), ("Read with a relative path", true), ("apply_patch updating a workspace file", true), ("apply_patch adding a relative file", true),
+        ("apply_patch naming one file outside and one inside", true), ("apply_patch with no recognizable path", true),
     ]));
 }
 
@@ -98,8 +107,9 @@ fn builtin_tools_outside_the_workspace_are_allowed() {
         ("absolute outside", file("Read", "/outside/x.txt")),
         ("parent escape", tool_event("Read", "/repo/src", json!({"file_path": "../../outside/x.txt"}))),
         ("unserved cwd", tool_event("Read", "/elsewhere", json!({"file_path": "/elsewhere/a"}))),
+        ("apply_patch outside the workspace", patch("*** Begin Patch\n*** Update File: /outside/x.txt\n@@\n-a\n+b\n*** End Patch")),
     ]);
-    assert_eq!(got, expect(&[("absolute outside", false), ("parent escape", false), ("unserved cwd", false)]));
+    assert_eq!(got, expect(&[("absolute outside", false), ("parent escape", false), ("unserved cwd", false), ("apply_patch outside the workspace", false)]));
 }
 
 #[test]

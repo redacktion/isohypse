@@ -82,18 +82,16 @@ Protected settings continue to use the authorization flow selected during setup.
 
 ## Agent Workflow
 
-`isohypse call` and `isohypse hook` work with any agent that can run shell commands. The native adapters and Pi share one signed session transport, [harness/session.mjs](harness/session.mjs).
+`isohypse call` and `isohypse hook` work with any agent that can run shell commands. Pi uses the signed session transport in [harness/session.mjs](harness/session.mjs).
 
 | Harness | Adapter | Notes |
 | --- | --- | --- |
 | Claude Code | [harness/claude/plugin](harness/shell/README.md#claude-code) | `isohypse call` through the Bash tool, plus hooks that brief the agent at session start and route Read, Grep, Glob, Edit, Write and equivalent shell commands. Any Claude Code version. |
-| Codex | [harness/shell](harness/shell/README.md#codex-and-other-agents) | `isohypse call` through the shell tool, with an `AGENTS.md` instruction. Any Codex version. |
+| Codex | [harness/codex](harness/shell/README.md#codex) | Codex plugin: `isohypse call` through the shell tool, plus hooks that brief the agent and route `apply_patch` and equivalent shell commands. Any Codex version. |
 | Any shell-capable agent | [harness/shell](harness/shell/README.md) | The same two commands. |
-| Claude Code, native tool | [harness/claude](harness/claude/README.md) | Optional. Registers a native `isohypse` tool in a verified Claude Code build. Version-pinned. |
-| Codex, native tool | [harness/chatgpt/native](harness/chatgpt/native/README.md) | Optional. App-server extension in a pinned Codex build. |
 | Pi | [harness/pi](harness/pi/README.md) | `pisohypse` extension through Pi's extension API. Workspace access and edit/validation execution require explicit approval. |
 
-All adapters accept the same step fields: `label`, `arg`, `range`, `outline`, `paths`, `langs`, `max`, `literal`, `name`, `compact`, `full`, `tag`, `path`, `content`, `edits`, `checkpoint`. `context.log` and tagged `context.read` add saved-history fields.
+The Pi extension accepts these step fields: `label`, `arg`, `range`, `outline`, `paths`, `langs`, `max`, `literal`, `name`, `compact`, `full`, `tag`, `path`, `content`, `edits`, `checkpoint`. `context.log` and tagged `context.read` add saved-history fields.
 
 Start each task by loading the grammar:
 
