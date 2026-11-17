@@ -222,15 +222,12 @@ mod tests {
     fn encrypt_spec_selects_a_subset() {
         let mut config = Config::default();
         apply_encrypt_spec(&mut config, "objects,sessions");
-        let __ok0: bool = config.encrypt_objects && config.encrypt_sessions;
-        let __ok1: bool = !config.encrypt_caches && !config.encrypt_metadata;
+        assert!(config.encrypt_objects && config.encrypt_sessions);
+        assert!(!config.encrypt_caches && !config.encrypt_metadata);
         apply_encrypt_spec(&mut config, "none");
-        let __ok2: bool = !config.encrypt_objects;
+        assert!(!config.encrypt_objects);
         apply_encrypt_spec(&mut config, "all");
-        let __ok3: bool = config.encrypt_objects && config.encrypt_metadata;
-
-        let failed: Vec<&str> = [(__ok0, "config.encrypt_objects && config.encrypt_sessions"), (__ok1, "!config.encrypt_caches && !config.encrypt_metadata"), (__ok2, "!config.encrypt_objects"), (__ok3, "config.encrypt_objects && config.encrypt_metadata")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert!(config.encrypt_objects && config.encrypt_metadata);
     }
 
     #[test]
@@ -238,12 +235,9 @@ mod tests {
         let config = Config { mode: "micro".to_string(), cold_days: 30, ..Config::default() };
         let text = serde_json::to_string(&config).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
-        let __ok0: bool = (back.mode) == ("micro");
-        let __ok1: bool = (back.cold_days) == (30);
-        let __ok2: bool = back.encrypt_objects;
-
-        let failed: Vec<&str> = [(__ok0, "back.mode == \"micro\""), (__ok1, "back.cold_days == 30"), (__ok2, "back.encrypt_objects")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert_eq!(back.mode, "micro");
+        assert_eq!(back.cold_days, 30);
+        assert!(back.encrypt_objects);
     }
 }
 

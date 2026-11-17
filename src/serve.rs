@@ -550,40 +550,36 @@ mod tests {
 
         write_half.write_all(b"{\"do\":\"session.open\",\"label\":\"codex\"}\n").await.unwrap();
         let ready = next_frame(&mut lines).await;
-        let __ok0: bool = (ready["ch"]) == ("ready");
-        let __ok1: bool = ready["session"].as_str().unwrap().starts_with("codex.");
+        assert_eq!(ready["ch"], "ready", "{ready}");
+        assert!(ready["session"].as_str().unwrap().starts_with("codex."), "{ready}");
 
         // The grammar comes first: a client that has not read it cannot know tags or anchors.
         write_half.write_all(b"{\"do\":\"session.command\",\"id\":6,\"op\":\"context.prompt\"}\n").await.unwrap();
-        let __ok2: bool = (next_frame(&mut lines).await["ch"]) == ("ack");
-        let __ok3: bool = (next_frame(&mut lines).await["ch"]) == ("result");
+        assert_eq!(next_frame(&mut lines).await["ch"], "ack");
+        assert_eq!(next_frame(&mut lines).await["ch"], "result");
 
         write_half.write_all(b"{\"do\":\"session.command\",\"id\":7,\"op\":\"context.explore\",\"payload\":{\"arg\":\"probe\"}}\n").await.unwrap();
         let ack = next_frame(&mut lines).await;
-        let __ok4: bool = (ack["ch"]) == ("ack");
-        let __ok5: bool = (ack["id"]) == (7);
+        assert_eq!(ack["ch"], "ack");
+        assert_eq!(ack["id"], 7);
         let result = next_frame(&mut lines).await;
-        let __ok6: bool = (result["ch"]) == ("result");
-        let __ok7: bool = (result["id"]) == (7);
-        let __ok8: bool = result["output"].as_str().unwrap().starts_with("ran context.explore");
+        assert_eq!(result["ch"], "result");
+        assert_eq!(result["id"], 7);
+        assert!(result["output"].as_str().unwrap().starts_with("ran context.explore"));
 
         write_half.write_all(b"{\"do\":\"session.command\",\"id\":8,\"op\":\"boom\"}\n").await.unwrap();
         let _ack = next_frame(&mut lines).await;
         let err = next_frame(&mut lines).await;
-        let __ok9: bool = (err["ch"]) == ("error");
-        let __ok10: bool = (err["id"]) == (8);
+        assert_eq!(err["ch"], "error");
+        assert_eq!(err["id"], 8);
         let diagnostic: Value = serde_json::from_str(err["message"].as_str().unwrap()).unwrap();
-        let __ok11: bool = (diagnostic["current"]) == ("boom");
+        assert_eq!(diagnostic["current"], "boom");
 
         let _ = std::fs::remove_file(&path);
-
-        let failed: Vec<&str> = [(__ok0, "{ready}"), (__ok1, "{ready}"), (__ok2, "next_frame(&mut lines).await[\"ch\"] == \"ack\""), (__ok3, "next_frame(&mut lines).await[\"ch\"] == \"result\""), (__ok4, "ack[\"ch\"] == \"ack\""), (__ok5, "ack[\"id\"] == 7"), (__ok6, "result[\"ch\"] == \"result\""), (__ok7, "result[\"id\"] == 7"), (__ok8, "result[\"output\"].as_str().unwrap().starts_with(\"ran context.explore\")"), (__ok9, "err[\"ch\"] == \"error\""), (__ok10, "err[\"id\"] == 8"), (__ok11, "diagnostic[\"current\"] == \"boom\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[tokio::test]
     async fn piped_close_drains_commands_and_multiops_before_closing() {
-        let mut failed: Vec<String> = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let path = temp_socket();
             let listener = UnixListener::bind(&path).unwrap();
@@ -600,30 +596,28 @@ mod tests {
                 "{\"do\":\"session.close\"}\n",
             ).as_bytes()).await.unwrap();
             write_half.shutdown().await.unwrap();
-            { let ok: bool = (next_frame(&mut lines).await["ch"]) == ("ready"); if !ok { failed.push("next_frame(&mut lines).await[\"ch\"] == \"ready\"".to_string()); } };
+            assert_eq!(next_frame(&mut lines).await["ch"], "ready");
             let mut acks = std::collections::HashSet::new();
             let mut results = std::collections::HashSet::new();
             for _ in 0..6 {
                 let frame = next_frame(&mut lines).await;
                 let id = frame["id"].as_u64().unwrap();
                 match frame["ch"].as_str().unwrap() {
-                    "ack" => { { let ok: bool = acks.insert(id); if !ok { failed.push("acks.insert(id)".to_string()); } }; }
-                    "result" => { { let ok: bool = acks.contains(&id); if !ok { failed.push("acks.contains(&id)".to_string()); } }; { let ok: bool = results.insert(id); if !ok { failed.push("results.insert(id)".to_string()); } }; }
+                    "ack" => { assert!(acks.insert(id)); }
+                    "result" => { assert!(acks.contains(&id)); assert!(results.insert(id)); }
                     _ => panic!("unexpected frame: {frame}"),
                 }
             }
-            { let ok: bool = (results) == ([0, 1, 2].into_iter().collect()); if !ok { failed.push("results == [0, 1, 2].into_iter().collect()".to_string()); } };
-            { let ok: bool = (next_frame(&mut lines).await["state"]["closed"]) == (true); if !ok { failed.push("next_frame(&mut lines).await[\"state\"][\"closed\"] == true".to_string()); } };
-            { let ok: bool = lines.next_line().await.unwrap().is_none(); if !ok { failed.push("lines.next_line().await.unwrap().is_none()".to_string()); } };
-            { let ok: bool = (registry.count()) == (0); if !ok { failed.push("registry.count() == 0".to_string()); } };
+            assert_eq!(results, [0, 1, 2].into_iter().collect());
+            assert_eq!(next_frame(&mut lines).await["state"]["closed"], true);
+            assert!(lines.next_line().await.unwrap().is_none());
+            assert_eq!(registry.count(), 0);
             std::fs::remove_file(path).unwrap();
         }).await.expect("piped session hung");
-        assert_eq!(failed, Vec::<String>::new(), "these checks failed");
     }
 
     #[tokio::test]
     async fn observer_checks_evaluated_multiops_before_dispatch() {
-        let mut failed: Vec<String> = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let path = temp_socket();
             let listener = UnixListener::bind(&path).unwrap();
@@ -633,10 +627,10 @@ mod tests {
             let (read_half, mut write_half) = stream.into_split();
             let mut lines = BufReader::new(read_half).lines();
             write_half.write_all(b"{\"do\":\"session.open\",\"label\":\"observer\",\"observer\":true}\n").await.unwrap();
-            { let ok: bool = (next_frame(&mut lines).await["ch"]) == ("ready"); if !ok { failed.push("next_frame(&mut lines).await[\"ch\"] == \"ready\"".to_string()); } };
+            assert_eq!(next_frame(&mut lines).await["ch"], "ready");
             write_half.write_all(b"{\"do\":\"session.command\",\"id\":99,\"op\":\"context.prompt\"}\n").await.unwrap();
-            { let ok: bool = (next_frame(&mut lines).await["ch"]) == ("ack"); if !ok { failed.push("next_frame(&mut lines).await[\"ch\"] == \"ack\"".to_string()); } };
-            { let ok: bool = (next_frame(&mut lines).await["ch"]) == ("result"); if !ok { failed.push("next_frame(&mut lines).await[\"ch\"] == \"result\"".to_string()); } };
+            assert_eq!(next_frame(&mut lines).await["ch"], "ack");
+            assert_eq!(next_frame(&mut lines).await["ch"], "result");
             let batches = [
                 (json!({"steps":[{"op":"context.read","arg":"a.rs"}]}), "result"),
                 (json!({"steps":[{"op":"context.read"},{"op":"mutate.create","path":"escape"}],"validate":"true"}), "error"),
@@ -654,22 +648,21 @@ mod tests {
             for (id, (batch, expected)) in batches.into_iter().enumerate() {
                 let frame = json!({"do":"session.multiop","id":id,"expr":"$batch | fromjson","bind":{"batch":batch.to_string()}});
                 write_half.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
-                { let ok: bool = (next_frame(&mut lines).await["ch"]) == ("ack"); if !ok { failed.push("next_frame(&mut lines).await[\"ch\"] == \"ack\"".to_string()); } };
+                assert_eq!(next_frame(&mut lines).await["ch"], "ack");
                 let result = next_frame(&mut lines).await;
-                { let ok: bool = (result["ch"]) == (expected); if !ok { failed.push("{result}".to_string()); } };
-                { let ok: bool = (result["id"]) == (id); if !ok { failed.push("result[\"id\"] == id".to_string()); } };
+                assert_eq!(result["ch"], expected, "{result}");
+                assert_eq!(result["id"], id);
             }
             // The ordinary-command sibling must not bypass the same observer policy.
             for op in ["build", "mutate.create", "macro.run", "state.up"] {
                 let frame = json!({"do":"session.command","id":100,"op":op});
                 write_half.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
-                { let ok: bool = (next_frame(&mut lines).await["ch"]) == ("error"); if !ok { failed.push("next_frame(&mut lines).await[\"ch\"] == \"error\"".to_string()); } };
+                assert_eq!(next_frame(&mut lines).await["ch"], "error");
             }
             write_half.write_all(b"{\"do\":\"session.close\"}\n").await.unwrap();
-            { let ok: bool = (next_frame(&mut lines).await["state"]["closed"]) == (true); if !ok { failed.push("next_frame(&mut lines).await[\"state\"][\"closed\"] == true".to_string()); } };
+            assert_eq!(next_frame(&mut lines).await["state"]["closed"], true);
             std::fs::remove_file(path).unwrap();
         }).await.expect("observer session hung");
-        assert_eq!(failed, Vec::<String>::new(), "these checks failed");
     }
 
     #[tokio::test]
@@ -685,13 +678,10 @@ mod tests {
 
         write_half.write_all(b"{\"do\":\"session.command\",\"id\":1,\"op\":\"context.explore\"}\n").await.unwrap();
         let err = next_frame(&mut lines).await;
-        let __ok0: bool = (err["ch"]) == ("error");
-        let __ok1: bool = err["message"].as_str().unwrap().contains("open a session");
+        assert_eq!(err["ch"], "error");
+        assert!(err["message"].as_str().unwrap().contains("open a session"), "{err}");
 
         let _ = std::fs::remove_file(&path);
-
-        let failed: Vec<&str> = [(__ok0, "err[\"ch\"] == \"error\""), (__ok1, "{err}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[tokio::test]
@@ -710,17 +700,14 @@ mod tests {
         write_half.write_all(b"{\"do\":\"session.subscribe\",\"kinds\":[\"file-changed\"],\"workspaces\":[]}\n").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let snapshot = next_frame(&mut lines).await;
-        let __ok0: bool = (snapshot["ch"]) == ("snapshot");
+        assert_eq!(snapshot["ch"], "snapshot", "{snapshot}");
 
         registry.publish("file-changed", None, &json!({ "path": "x.rs" }));
         let event = next_frame(&mut lines).await;
-        let __ok1: bool = (event["ch"]) == ("event");
-        let __ok2: bool = (event["kind"]) == ("file-changed");
-        let __ok3: bool = (event["payload"]["path"]) == ("x.rs");
+        assert_eq!(event["ch"], "event");
+        assert_eq!(event["kind"], "file-changed");
+        assert_eq!(event["payload"]["path"], "x.rs");
 
         let _ = std::fs::remove_file(&path);
-
-        let failed: Vec<&str> = [(__ok0, "{snapshot}"), (__ok1, "event[\"ch\"] == \"event\""), (__ok2, "event[\"kind\"] == \"file-changed\""), (__ok3, "event[\"payload\"][\"path\"] == \"x.rs\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

@@ -17,47 +17,40 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[test]
 fn an_open_frame_round_trips_with_its_resume_token() {
-    let mut failed: Vec<String> = Vec::new();
     let line = r#"{"do":"session.open","label":"codex-ui-1","resume":{"session":"codex-ui-1.7f3a","token":"abc"}}"#;
     match Inbound::parse(line).unwrap() {
         Inbound::Open { label, resume, observer } => {
-            { let ok: bool = (label) == ("codex-ui-1"); if !ok { failed.push("label == \"codex-ui-1\"".to_string()); } };
-            { let ok: bool = !observer; if !ok { failed.push("!observer".to_string()); } };
+            assert_eq!(label, "codex-ui-1");
+            assert!(!observer);
             let resume = resume.unwrap();
-            { let ok: bool = (resume.session) == ("codex-ui-1.7f3a"); if !ok { failed.push("resume.session == \"codex-ui-1.7f3a\"".to_string()); } };
-            { let ok: bool = (resume.token) == ("abc"); if !ok { failed.push("resume.token == \"abc\"".to_string()); } };
+            assert_eq!(resume.session, "codex-ui-1.7f3a");
+            assert_eq!(resume.token, "abc");
         }
         other => panic!("expected open, got {other:?}"),
     }
-    assert_eq!(failed, Vec::<String>::new(), "these checks failed");
 }
 
 #[test]
 fn a_command_frame_carries_its_id_and_payload() {
-    let mut failed: Vec<String> = Vec::new();
     let line = r#"{"do":"session.command","id":7,"op":"context.explore","payload":{"arg":"multi-op"}}"#;
     match Inbound::parse(line).unwrap() {
         Inbound::Command { id, op, workspace, payload } => {
-            { let ok: bool = (id) == (json!(7)); if !ok { failed.push("id == json!(7)".to_string()); } };
-            { let ok: bool = (op) == ("context.explore"); if !ok { failed.push("op == \"context.explore\"".to_string()); } };
-            { let ok: bool = workspace.is_none(); if !ok { failed.push("workspace.is_none()".to_string()); } };
-            { let ok: bool = (payload) == (json!({"arg": "multi-op"})); if !ok { failed.push("payload == json!({{\"arg\": \"multi-op\"}})".to_string()); } };
+            assert_eq!(id, json!(7));
+            assert_eq!(op, "context.explore");
+            assert!(workspace.is_none());
+            assert_eq!(payload, json!({"arg": "multi-op"}));
         }
         other => panic!("expected command, got {other:?}"),
     }
-    assert_eq!(failed, Vec::<String>::new(), "these checks failed");
 }
 
 #[test]
 fn an_error_frame_omits_false_retry_and_absent_fields() {
     let line = Outbound::Error { id: None, seq: 3, message: "boom".to_string(), retry: false, backoff_ms: None }.line();
-    let __ok0: bool = line.contains("\"ch\":\"error\"");
-    let __ok1: bool = !line.contains("retry");
-    let __ok2: bool = !line.contains("backoff_ms");
-    let __ok3: bool = !line.contains("\"id\"");
-
-    let failed: Vec<&str> = [(__ok0, "{line}"), (__ok1, "{line}"), (__ok2, "{line}"), (__ok3, "{line}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(line.contains("\"ch\":\"error\""), "{line}");
+    assert!(!line.contains("retry"), "{line}");
+    assert!(!line.contains("backoff_ms"), "{line}");
+    assert!(!line.contains("\"id\""), "{line}");
 }
 
 #[test]
@@ -70,11 +63,8 @@ fn a_retry_error_frame_includes_its_backoff() {
         backoff_ms: Some(250),
     }
     .line();
-    let __ok0: bool = line.contains("\"retry\":true");
-    let __ok1: bool = line.contains("\"backoff_ms\":250");
-
-    let failed: Vec<&str> = [(__ok0, "{line}"), (__ok1, "{line}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(line.contains("\"retry\":true"), "{line}");
+    assert!(line.contains("\"backoff_ms\":250"), "{line}");
 }
 
 // ── a real session, end to end ───────────────────────────────────────────────
@@ -132,12 +122,9 @@ fn a_session_result_carries_no_budget_line() {
 
     let frames = session_run(&root, &[("context.read", json!({"arg": "a.rs"}))]);
     let text = output(&frames[0]);
-    let __ok0: bool = text.contains("fn a()");
-    let __ok1: bool = !text.contains("remaining session tool calls");
-    let __ok2: bool = !text.to_lowercase().contains("budget");
-
-    let failed: Vec<&str> = [(__ok0, "the read still returns its content: {text}"), (__ok1, "the budget line is gone: {text}"), (__ok2, "no budget guidance rides the output: {text}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(text.contains("fn a()"), "the read still returns its content: {text}");
+    assert!(!text.contains("remaining session tool calls"), "the budget line is gone: {text}");
+    assert!(!text.to_lowercase().contains("budget"), "no budget guidance rides the output: {text}");
 }
 
 #[test]
@@ -153,13 +140,10 @@ fn a_session_reads_explores_edits_and_reindexes() {
             "edits": [{"replace": {"lines": [2, 2]}, "with": "    String::from(\"hello\")"}]})),
         ("state.up", json!({"reindex": true})),
     ]);
-    let __ok0: bool = output(&frames[0]).contains("main -> greet") || output(&frames[0]).contains("main -(");
-    let __ok1: bool = output(&frames[1]).contains("updated [lib.rs#");
-    let __ok2: bool = fs::read_to_string(root.join("lib.rs")).unwrap().contains("hello");
-    let __ok3: bool = output(&frames[2]).contains("reindex started");
-
-    let failed: Vec<&str> = [(__ok0, "{}"), (__ok1, "{}"), (__ok2, "fs::read_to_string(root.join(\"lib.rs\")).unwrap().contains(\"hello\")"), (__ok3, "{}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(output(&frames[0]).contains("main -> greet") || output(&frames[0]).contains("main -("), "{}", output(&frames[0]));
+    assert!(output(&frames[1]).contains("updated [lib.rs#"), "{}", output(&frames[1]));
+    assert!(fs::read_to_string(root.join("lib.rs")).unwrap().contains("hello"));
+    assert!(output(&frames[2]).contains("reindex started"), "{}", output(&frames[2]));
 }
 
 #[test]
@@ -171,11 +155,8 @@ fn a_session_stores_and_fetches_a_payload_by_tag() {
         ("state.put", json!({"arg": "handle payload"})),
         ("state.get", json!({"arg": isohypse::tag::display_tag("handle payload")})),
     ]);
-    let __ok0: bool = output(&frames[0]).contains('#');
-    let __ok1: bool = (output(&frames[1]).lines().next().unwrap()) == ("handle payload");
-
-    let failed: Vec<&str> = [(__ok0, "{}"), (__ok1, "{}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(output(&frames[0]).contains('#'), "{}", output(&frames[0]));
+    assert_eq!(output(&frames[1]).lines().next().unwrap(), "handle payload", "{}", output(&frames[1]));
 }
 
 #[test]
@@ -197,15 +178,12 @@ fn a_saved_macro_runs_its_steps() {
         ("macro.save", json!({"name": name, "steps": [{"op": "state.status"}]})),
         ("macro.run", json!({"name": name})),
     ]);
-    let __ok0: bool = output(&frames[0]).contains("saved");
-    let __ok1: bool = output(&frames[1]).contains("1 step(s)");
+    assert!(output(&frames[0]).contains("saved"), "{}", output(&frames[0]));
+    assert!(output(&frames[1]).contains("1 step(s)"), "{}", output(&frames[1]));
 
     if let Ok(store) = std::env::var("ISOHYPSE_STORE") {
         let _ = fs::remove_file(std::path::PathBuf::from(store).join("macros").join(format!("{name}.json")));
     }
-
-    let failed: Vec<&str> = [(__ok0, "{}"), (__ok1, "{}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
 }
 
 // ── the workspace socket ─────────────────────────────────────────────────────
@@ -217,13 +195,10 @@ fn the_workspace_socket_serves_status_and_up() {
     let handle = socket_server(&root, 2);
 
     let status = request(&root, &json!({"op": "state.status"}));
-    let __ok0: bool = status.contains("indexed files: 1");
-    let __ok1: bool = (request(&root, &json!({"op": "state.up", "reindex": true}))) == ("reindex started\n");
+    assert!(status.contains("indexed files: 1"), "{status}");
+    assert_eq!(request(&root, &json!({"op": "state.up", "reindex": true})), "reindex started\n");
 
     handle.join().unwrap();
-
-    let failed: Vec<&str> = [(__ok0, "{status}"), (__ok1, "request(&root, &json!({{\"op\": \"state.up\", \"reindex\": true}})) == \"reinde")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
 }
 
 #[test]
@@ -234,13 +209,10 @@ fn the_workspace_socket_refuses_an_op_that_needs_a_session() {
     let socket = daemon::find_socket(&root).unwrap();
 
     let refused = daemon::request(&socket, &json!({"op": "context.explore", "arg": "greet"})).unwrap_err();
-    let __ok0: bool = refused.contains("not available on the workspace socket");
-    let __ok1: bool = refused.contains("session");
+    assert!(refused.contains("not available on the workspace socket"), "{refused}");
+    assert!(refused.contains("session"), "the refusal names the way in: {refused}");
 
     handle.join().unwrap();
-
-    let failed: Vec<&str> = [(__ok0, "{refused}"), (__ok1, "the refusal names the way in: {refused}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
 }
 
 // ── multi-op transactions ────────────────────────────────────────────────────
@@ -267,14 +239,11 @@ fn a_multi_op_applies_every_step_and_keeps_the_mutation_ledger() {
             ]}),
         )
         .unwrap();
-    let __ok0: bool = summary.contains("3 step(s), transactional");
-    let __ok1: bool = report["mutate"][0]["json"]["sections"][0]["preview"].as_str().unwrap().contains("+    11");
-    let __ok2: bool = (report["mutate"][2]["json"]["content"]) == ("created\n");
-    let __ok3: bool = fs::read_to_string(root.join("a.rs")).unwrap().contains("11");
-    let __ok4: bool = fs::read_to_string(root.join("b.rs")).unwrap().contains("22");
-
-    let failed: Vec<&str> = [(__ok0, "{summary}"), (__ok1, "report[\"mutate\"][0][\"json\"][\"sections\"][0][\"preview\"].as_str().unwrap("), (__ok2, "report[\"mutate\"][2][\"json\"][\"content\"] == \"created\\n\""), (__ok3, "fs::read_to_string(root.join(\"a.rs\")).unwrap().contains(\"11\")"), (__ok4, "fs::read_to_string(root.join(\"b.rs\")).unwrap().contains(\"22\")")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(summary.contains("3 step(s), transactional"), "{summary}");
+    assert!(report["mutate"][0]["json"]["sections"][0]["preview"].as_str().unwrap().contains("+    11"));
+    assert_eq!(report["mutate"][2]["json"]["content"], "created\n");
+    assert!(fs::read_to_string(root.join("a.rs")).unwrap().contains("11"));
+    assert!(fs::read_to_string(root.join("b.rs")).unwrap().contains("22"));
 }
 
 #[test]
@@ -297,11 +266,8 @@ fn a_failing_step_reverts_every_prior_step() {
             ]}),
         )
         .unwrap_err();
-    let __ok0: bool = error.contains("reverted");
-    let __ok1: bool = !fs::read_to_string(root.join("a.rs")).unwrap().contains("99");
-
-    let failed: Vec<&str> = [(__ok0, "rollback message: {error}"), (__ok1, "step 1 rolled back")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(error.contains("reverted"), "rollback message: {error}");
+    assert!(!fs::read_to_string(root.join("a.rs")).unwrap().contains("99"), "step 1 rolled back");
 }
 
 #[test]
@@ -321,11 +287,8 @@ fn a_validation_failure_reverts_the_edit() {
             ]}),
         )
         .unwrap_err();
-    let __ok0: bool = error.contains("verify");
-    let __ok1: bool = !fs::read_to_string(root.join("a.rs")).unwrap().contains("77");
-
-    let failed: Vec<&str> = [(__ok0, "verify failure surfaced: {error}"), (__ok1, "verify failure rolled back")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(error.contains("verify"), "verify failure surfaced: {error}");
+    assert!(!fs::read_to_string(root.join("a.rs")).unwrap().contains("77"), "verify failure rolled back");
 }
 
 #[test]
@@ -339,18 +302,14 @@ fn a_multi_op_delete_step_carries_the_removed_text() {
         ]}))
         .unwrap();
     let step = &report["mutate"][0]["json"];
-    let __ok0: bool = (step["op"]) == ("mutate.delete");
-    let __ok1: bool = (step["path"]) == ("gone.txt");
-    let __ok2: bool = (step["content"]) == ("line one\nline two\n");
-    let __ok3: bool = !root.join("gone.txt").exists();
-
-    let failed: Vec<&str> = [(__ok0, "step[\"op\"] == \"mutate.delete\""), (__ok1, "step[\"path\"] == \"gone.txt\""), (__ok2, "the host renders the deletion from this text"), (__ok3, "!root.join(\"gone.txt\").exists()")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert_eq!(step["op"], "mutate.delete");
+    assert_eq!(step["path"], "gone.txt");
+    assert_eq!(step["content"], "line one\nline two\n", "the host renders the deletion from this text");
+    assert!(!root.join("gone.txt").exists());
 }
 
 #[test]
 fn a_multi_op_reads_saved_history_without_leaving_its_scope() {
-    let mut failed: Vec<String> = Vec::new();
     let root = scratch_dir("multi-op-history");
     let archived = root.with_extension("archived");
     let store = isohypse::objects::ObjectStore::open().unwrap();
@@ -368,8 +327,8 @@ fn a_multi_op_reads_saved_history_without_leaving_its_scope() {
             ]}),
         )
         .unwrap();
-    { let ok: bool = output.contains("retained_native_history"); if !ok { failed.push("{output}".to_string()); } };
-    { let ok: bool = !path.exists(); if !ok { failed.push("retrieval must not restore source".to_string()); } };
+    assert!(output.contains("retained_native_history"), "{output}");
+    assert!(!path.exists(), "retrieval must not restore source");
 
     for step in [
         json!({"op": "context.read", "workspace": archived, "arg": "old.rs"}),
@@ -378,7 +337,6 @@ fn a_multi_op_reads_saved_history_without_leaving_its_scope() {
         let error = dispatcher(&root)
             .dispatch("multi-op", None, &json!({"steps": [step]}))
             .unwrap_err();
-        { let ok: bool = error.contains("cannot target other workspaces"); if !ok { failed.push("{error}".to_string()); } };
+        assert!(error.contains("cannot target other workspaces"), "{error}");
     }
-    assert_eq!(failed, Vec::<String>::new(), "these checks failed");
 }

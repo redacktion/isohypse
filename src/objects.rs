@@ -1093,29 +1093,26 @@ mod tests {
         let root = std::env::temp_dir().join(format!("iso-persist-{}", std::process::id()));
         persist_workspace(&root, true, false);
         let found = persisted_workspaces(3 * 24 * 60 * 60);
-        let __ok0: bool = found.iter().any(|(r, lsp, sem)| r == &root && *lsp && !*sem);
+        assert!(
+            found.iter().any(|(r, lsp, sem)| r == &root && *lsp && !*sem),
+            "persisted entry present"
+        );
         forget_workspace(&root);
         let after = persisted_workspaces(3 * 24 * 60 * 60);
-        let __ok1: bool = !after.iter().any(|(r, _, _)| r == &root);
-
-        let failed: Vec<&str> = [(__ok0, "persisted entry present"), (__ok1, "forgotten entry gone")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert!(!after.iter().any(|(r, _, _)| r == &root), "forgotten entry gone");
     }
 
     #[test]
     fn sealed_roundtrip() {
         let key = [7u8; 32];
         let sealed = seal_with(&key, b"store metadata").unwrap();
-        let __ok0: bool = (&sealed[13..]) != (b"store metadata".as_slice());
-        let __ok1: bool = (open_with(&key, &sealed).unwrap()) == (b"store metadata");
-        let __ok2: bool = open_with(&[8u8; 32], &sealed).is_none();
+        assert_ne!(&sealed[13..], b"store metadata".as_slice());
+        assert_eq!(open_with(&key, &sealed).unwrap(), b"store metadata");
+        assert!(open_with(&[8u8; 32], &sealed).is_none());
         let mut tampered = sealed.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
-        let __ok3: bool = open_with(&key, &tampered).is_none();
-
-        let failed: Vec<&str> = [(__ok0, "&sealed[13..] != b\"store metadata\".as_slice()"), (__ok1, "open_with(&key, &sealed).unwrap() == b\"store metadata\""), (__ok2, "open_with(&[8u8; 32], &sealed).is_none()"), (__ok3, "open_with(&key, &tampered).is_none()")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert!(open_with(&key, &tampered).is_none());
     }
 
     fn temp_store() -> ObjectStore {
@@ -1130,19 +1127,17 @@ mod tests {
 
     #[test]
     fn index_resolves_by_prefix() {
-        let mut failed: Vec<String> = Vec::new();
         let store = temp_store();
         let full = store.put("fn alpha() {}\n").unwrap();
-        { let ok: bool = store.index_tags().contains(&full); if !ok { failed.push("index missing tag".to_string()); } };
+        assert!(store.index_tags().contains(&full), "index missing tag");
         match store.resolve(&full[..8]) {
             Resolution::Found(found, content) => {
-                { let ok: bool = (found) == (full); if !ok { failed.push("found == full".to_string()); } };
-                { let ok: bool = (content) == ("fn alpha() {}\n"); if !ok { failed.push("content == \"fn alpha() {{}}\\n\"".to_string()); } };
+                assert_eq!(found, full);
+                assert_eq!(content, "fn alpha() {}\n");
             }
             _ => panic!("prefix should resolve to the stored object"),
         }
-        { let ok: bool = matches!(store.resolve(&full), Resolution::Found(_, _)); if !ok { failed.push("matches!(store.resolve(&full), Resolution::Found(_, _))".to_string()); } };
-        assert_eq!(failed, Vec::<String>::new(), "these checks failed");
+        assert!(matches!(store.resolve(&full), Resolution::Found(_, _)));
     }
 
     #[test]
@@ -1151,14 +1146,11 @@ mod tests {
         let one = store.put("one\n").unwrap();
         let two = store.put("two\n").unwrap();
         let _ = fs::remove_file(store.index_path());
-        let __ok0: bool = store.index_tags().is_empty();
+        assert!(store.index_tags().is_empty(), "index file not cleared");
         store.rebuild_index();
         let tags = store.index_tags();
-        let __ok1: bool = tags.contains(&one);
-        let __ok2: bool = tags.contains(&two);
-
-        let failed: Vec<&str> = [(__ok0, "index file not cleared"), (__ok1, "missing one"), (__ok2, "missing two")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert!(tags.contains(&one), "missing one");
+        assert!(tags.contains(&two), "missing two");
     }
 
     #[test]
@@ -1169,11 +1161,8 @@ mod tests {
         let before = fs::read(&path).unwrap()[0];
         reseal_objects(&store);
         let after = fs::read(&path).unwrap()[0];
-        let __ok0: bool = (before) == (after);
-        let __ok1: bool = (store.read_object(&full).unwrap()) == ("secret body\n");
-
-        let failed: Vec<&str> = [(__ok0, "reseal is idempotent under unchanged config"), (__ok1, "store.read_object(&full).unwrap() == \"secret body\\n\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert_eq!(before, after, "reseal is idempotent under unchanged config");
+        assert_eq!(store.read_object(&full).unwrap(), "secret body\n");
     }
 
     #[test]
@@ -1181,11 +1170,8 @@ mod tests {
         let config = crate::setup::Config::load();
         let blob = seal_bytes(OBJECTS_SEAL_CTX, b"hello").unwrap();
         let expected = if config.encrypt_objects { SEAL_VERSION } else { PLAIN_VERSION };
-        let __ok0: bool = (blob[0]) == (expected);
-        let __ok1: bool = (open_bytes(OBJECTS_SEAL_CTX, &blob).unwrap()) == (b"hello");
-
-        let failed: Vec<&str> = [(__ok0, "object seal format must follow config"), (__ok1, "open_bytes(OBJECTS_SEAL_CTX, &blob).unwrap() == b\"hello\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert_eq!(blob[0], expected, "object seal format must follow config");
+        assert_eq!(open_bytes(OBJECTS_SEAL_CTX, &blob).unwrap(), b"hello");
     }
 
     #[test]
@@ -1196,14 +1182,11 @@ mod tests {
         set_enc_override(Some(on));
         let full = store.put("secret body\n").unwrap();
         let path = store.object_path(&full).unwrap();
-        let __ok0: bool = (fs::read(&path).unwrap()[0]) == (SEAL_VERSION);
+        assert_eq!(fs::read(&path).unwrap()[0], SEAL_VERSION, "sealed while on");
         set_enc_override(Some(off));
         reseal_objects(&store);
-        let __ok1: bool = (fs::read(&path).unwrap()[0]) == (PLAIN_VERSION);
-        let __ok2: bool = (store.read_object(&full).unwrap()) == ("secret body\n");
+        assert_eq!(fs::read(&path).unwrap()[0], PLAIN_VERSION, "plaintext after toggling off");
+        assert_eq!(store.read_object(&full).unwrap(), "secret body\n");
         set_enc_override(None);
-
-        let failed: Vec<&str> = [(__ok0, "sealed while on"), (__ok1, "plaintext after toggling off"), (__ok2, "store.read_object(&full).unwrap() == \"secret body\\n\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

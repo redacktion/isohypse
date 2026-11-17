@@ -319,14 +319,11 @@ fn release_promotion_preserves_running_images() {
     std::fs::write(&second, "second").unwrap();
     promote_release(&first, &install, "first").unwrap();
     promote_release(&second, &install, "second").unwrap();
-    let __ok0: bool = (std::fs::read_to_string(&install).unwrap()) == ("second");
-    let __ok1: bool = (std::fs::read_to_string(&first).unwrap()) == ("first");
-    let __ok2: bool = (std::fs::read_to_string(root.join("isohypse.build-retained-first")).unwrap()) == ("legacy");
-    let __ok3: bool = (std::fs::canonicalize(&install).unwrap()) == (std::fs::canonicalize(&second).unwrap());
+    assert_eq!(std::fs::read_to_string(&install).unwrap(), "second");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+    assert_eq!(std::fs::read_to_string(root.join("isohypse.build-retained-first")).unwrap(), "legacy");
+    assert_eq!(std::fs::canonicalize(&install).unwrap(), std::fs::canonicalize(&second).unwrap());
     std::fs::remove_dir_all(root).unwrap();
-
-    let failed: Vec<&str> = [(__ok0, "std::fs::read_to_string(&install).unwrap() == \"second\""), (__ok1, "std::fs::read_to_string(&first).unwrap() == \"first\""), (__ok2, "std::fs::read_to_string(root.join(\"isohypse.build-retained-first\")).un"), (__ok3, "std::fs::canonicalize(&install).unwrap() == std::fs::canonicalize(&sec")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
 }
 
 fn update_check() -> Result<String, String> {

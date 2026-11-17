@@ -189,22 +189,16 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("store.key"), [7u8; 32]).unwrap();
         let body = manifest_body_at(&dir);
-        let __ok0: bool = body.starts_with("isohypse-manifest v1\n");
-        let __ok1: bool = body.contains("key store.key ");
-        let __ok2: bool = !body.contains("refs/refs.key");
+        assert!(body.starts_with("isohypse-manifest v1\n"));
+        assert!(body.contains("key store.key "));
+        assert!(!body.contains("refs/refs.key"));
         let _ = std::fs::remove_dir_all(&dir);
-
-        let failed: Vec<&str> = [(__ok0, "body.starts_with(\"isohypse-manifest v1\\n\")"), (__ok1, "body.contains(\"key store.key \")"), (__ok2, "!body.contains(\"refs/refs.key\")")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
     fn hex_round_trip() {
         let bytes = [0u8, 1, 15, 16, 200, 255];
-        let __ok0: bool = (hex_decode(&hex_encode(&bytes)).unwrap()) == (bytes.to_vec());
-        let __ok1: bool = (hex_decode("a\u{e9}b")) == (None);
-
-        let failed: Vec<&str> = [(__ok0, "hex_decode(&hex_encode(&bytes)).unwrap() == bytes.to_vec()"), (__ok1, "non-ASCII text of even byte length must not panic")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes.to_vec());
+        assert_eq!(hex_decode("a\u{e9}b"), None, "non-ASCII text of even byte length must not panic");
     }
 }

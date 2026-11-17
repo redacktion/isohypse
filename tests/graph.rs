@@ -105,24 +105,21 @@ fn indexed(name: &str, file: &str, source: &str) -> GraphIndex {
 fn a_rust_call_is_direct_typed_or_dyn_by_receiver() {
     let index = indexed("tiers-rust", "zoo.rs", RUST_ZOO);
 
-    let __ok0: bool = (edges_into(&index, "bark", "::").get("Dog::speak")) == (Some(&vec!["direct".to_string()]));
-    let __ok1: bool = (edges_into(&index, "bark", "::").get("free")) == (Some(&vec!["direct".to_string()]));
+    assert_eq!(edges_into(&index, "bark", "::").get("Dog::speak"), Some(&vec!["direct".to_string()]));
+    assert_eq!(edges_into(&index, "bark", "::").get("free"), Some(&vec!["direct".to_string()]));
 
     let dog_speak = edges_into(&index, "Dog::speak", "::");
-    let __ok2: bool = (dog_speak.get("pet")) == (Some(&vec!["typed".to_string()]));
-    let __ok3: bool = (dog_speak.get("hear")) == (Some(&vec!["dyn".to_string()]));
+    assert_eq!(dog_speak.get("pet"), Some(&vec!["typed".to_string()]), "a typed receiver binds Dog::speak: {dog_speak:?}");
+    assert_eq!(dog_speak.get("hear"), Some(&vec!["dyn".to_string()]), "a dyn receiver fans out to Dog::speak: {dog_speak:?}");
 
     let cat_speak = edges_into(&index, "Cat::speak", "::");
-    let __ok4: bool = (cat_speak.get("hear")) == (Some(&vec!["dyn".to_string()]));
-    let __ok5: bool = !cat_speak.contains_key("pet");
+    assert_eq!(cat_speak.get("hear"), Some(&vec!["dyn".to_string()]), "dyn fan-out reaches every implementor: {cat_speak:?}");
+    assert!(!cat_speak.contains_key("pet"), "a typed receiver must not fan out: {cat_speak:?}");
 
     let robot_speak = edges_into(&index, "Robot::speak", "::");
-    let __ok6: bool = !robot_speak.contains_key("hear");
+    assert!(!robot_speak.contains_key("hear"), "Robot never impls Speak, so dyn fan-out must not reach it: {robot_speak:?}");
 
-    let __ok7: bool = (edges_into(&index, "Speak::speak", "::").get("hear")) == (Some(&vec!["dyn".to_string()]));
-
-    let failed: Vec<&str> = [(__ok0, "edges_into(&index, \"bark\", \"::\").get(\"Dog::speak\") == Some(&vec![\"dire"), (__ok1, "edges_into(&index, \"bark\", \"::\").get(\"free\") == Some(&vec![\"direct\".to"), (__ok2, "a typed receiver binds Dog::speak: {dog_speak:?}"), (__ok3, "a dyn receiver fans out to Dog::speak: {dog_speak:?}"), (__ok4, "dyn fan-out reaches every implementor: {cat_speak:?}"), (__ok5, "a typed receiver must not fan out: {cat_speak:?}"), (__ok6, "Robot never impls Speak, so dyn fan-out must not reach it: {robot_speak:?}"), (__ok7, "edges_into(&index, \"Speak::speak\", \"::\").get(\"hear\") == Some(&vec![\"dy")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert_eq!(edges_into(&index, "Speak::speak", "::").get("hear"), Some(&vec!["dyn".to_string()]));
 }
 
 #[test]
@@ -136,12 +133,9 @@ fn callers_split_into_confirmed_and_dynamic() {
         .unwrap();
 
     let callers = index.callers_of(&dog_speak.id);
-    let __ok0: bool = (callers.confirmed.len()) == (1);
-    let __ok1: bool = (callers.dynamic.len()) == (1);
-    let __ok2: bool = (callers.dynamic[0].1) == ("Speak");
-
-    let failed: Vec<&str> = [(__ok0, "exact-tier callers: {:?}"), (__ok1, "dynamic callers: {:?}"), (__ok2, "callers.dynamic[0].1 == \"Speak\"")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert_eq!(callers.confirmed.len(), 1, "exact-tier callers: {:?}", callers.confirmed);
+    assert_eq!(callers.dynamic.len(), 1, "dynamic callers: {:?}", callers.dynamic);
+    assert_eq!(callers.dynamic[0].1, "Speak");
 }
 
 #[test]
@@ -149,11 +143,11 @@ fn a_typescript_call_resolves_to_the_same_tiers() {
     let index = indexed("tiers-typescript", "zoo.ts", TS_ZOO);
 
     let bark = edges_into(&index, "bark", ".");
-    let __ok0: bool = (bark.get("Dog.speak")) == (Some(&vec!["direct".to_string()]));
-    let __ok1: bool = (bark.get("free")) == (Some(&vec!["direct".to_string()]));
+    assert_eq!(bark.get("Dog.speak"), Some(&vec!["direct".to_string()]), "{bark:?}");
+    assert_eq!(bark.get("free"), Some(&vec!["direct".to_string()]), "{bark:?}");
 
     let dog_speak = edges_into(&index, "Dog.speak", ".");
-    let __ok2: bool = (dog_speak.get("pet")) == (Some(&vec!["typed".to_string()]));
+    assert_eq!(dog_speak.get("pet"), Some(&vec!["typed".to_string()]), "a typed receiver must bind Dog.speak: {dog_speak:?}");
 
     let callee = index
         .store
@@ -161,10 +155,7 @@ fn a_typescript_call_resolves_to_the_same_tiers() {
         .into_iter()
         .find(|s| s.qualified == "Dog.speak")
         .unwrap();
-    let __ok3: bool = (index.callers_of(&callee.id).confirmed.len()) == (1);
-
-    let failed: Vec<&str> = [(__ok0, "{bark:?}"), (__ok1, "{bark:?}"), (__ok2, "a typed receiver must bind Dog.speak: {dog_speak:?}"), (__ok3, "index.callers_of(&callee.id).confirmed.len() == 1")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert_eq!(index.callers_of(&callee.id).confirmed.len(), 1);
 }
 
 // ── determinism ──────────────────────────────────────────────────────────────
@@ -179,16 +170,13 @@ fn a_file_over_the_index_cap_is_counted_and_reported_in_status() {
 
     let mut index = GraphIndex::open(&root);
     let summary = index.full_index();
-    let __ok0: bool = (summary.oversized) == (1);
-    let __ok1: bool = (summary.files) == (1);
-    let __ok2: bool = (index.oversized_files) == (1);
+    assert_eq!(summary.oversized, 1, "one file is over the cap");
+    assert_eq!(summary.files, 1, "the small file is still indexed");
+    assert_eq!(index.oversized_files, 1, "the count stays on the index");
 
     let (status, _) = support::dispatcher(&root).dispatch("state.status", None, &serde_json::json!({})).unwrap();
-    let __ok3: bool = status.contains("over the");
-    let __ok4: bool = status.contains("1 file(s)");
-
-    let failed: Vec<&str> = [(__ok0, "one file is over the cap"), (__ok1, "the small file is still indexed"), (__ok2, "the count stays on the index"), (__ok3, "status names the cap: {status}"), (__ok4, "status counts what was dropped: {status}")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(status.contains("over the"), "status names the cap: {status}");
+    assert!(status.contains("1 file(s)"), "status counts what was dropped: {status}");
 }
 
 #[test]
@@ -205,12 +193,9 @@ fn two_indexes_of_one_tree_dump_identically_across_languages() {
     second.full_index();
 
     let dump = first.store.dump();
-    let __ok0: bool = !dump.is_empty();
-    let __ok1: bool = dump.contains("Oracle.ask");
-    let __ok2: bool = dump.contains("scale");
-    let __ok3: bool = dump.contains("notes.md#Nested");
-    let __ok4: bool = (dump) == (second.store.dump());
-
-    let failed: Vec<&str> = [(__ok0, "!dump.is_empty()"), (__ok1, "python classes are indexed"), (__ok2, "metal functions are indexed"), (__ok3, "markdown headings are indexed"), (__ok4, "the dump is deterministic")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-    assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+    assert!(!dump.is_empty());
+    assert!(dump.contains("Oracle.ask"), "python classes are indexed");
+    assert!(dump.contains("scale"), "metal functions are indexed");
+    assert!(dump.contains("notes.md#Nested"), "markdown headings are indexed");
+    assert_eq!(dump, second.store.dump(), "the dump is deterministic");
 }

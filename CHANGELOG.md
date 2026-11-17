@@ -24,7 +24,6 @@ All notable changes to Isohypse are documented here.
 
 - Hook: `find /usr -name x` no longer counts `x` as a workspace path, `kill $(pgrep isohypse)` is caught, and `<<EOF` is no longer read as a command argument.
 - `isohypse call` joins a text array given on a bare step (`content`, `with`, `body`).
-- Unit and integration tests are one assertion each, with per-test temp directories and macro names, so parallel runs no longer collide.
 - Allow patterns match exactly. `context.read` no longer allows `context.readx` or `context.read.evil`. A trailing dot (`context.`) opts into the whole subtree.
 - Enforcement state is a typed one-way machine (`src/policy.rs`). The per-session copy that was never set is removed.
 - Enforcement profiles with an allowlist no longer block every `session.multiop`. Each step is checked against the policy, including steps inside macros.

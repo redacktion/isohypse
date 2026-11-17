@@ -1218,29 +1218,26 @@ mod snapshot_safety_tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("large.txt");
         let original = format!("before\n{}", "snapshot padding\n".repeat(70000));
-        let __ok0: bool = original.len() > 1024 * 1024;
+        assert!(original.len() > 1024 * 1024);
         fs::write(&path, &original).unwrap();
         let mut patcher = Patcher::new(&root).unwrap();
         let read = patcher.read_with("large.txt", Some(1), Some(1), false, None).unwrap();
-        let __ok1: bool = read.contains("1:before\n") && read.len() < 1024;
+        assert!(read.contains("1:before\n") && read.len() < 1024);
         let tag = full_tag(&original);
-        let __ok2: bool = matches!(patcher.objects.resolve(&tag), Resolution::Found(_, body) if body == original);
+        assert!(matches!(patcher.objects.resolve(&tag), Resolution::Found(_, body) if body == original));
         let edit = serde_json::json!({"op":"mutate.edit", "path":"large.txt", "tag":tag,
             "edits":[{"replace":{"lines":[1,1]},"with":"after"}]});
         let error = patcher.apply_edits_verified(&edit, Some("false")).unwrap_err();
-        let __ok3: bool = error.contains("reverted");
-        let __ok4: bool = (fs::read_to_string(&path).unwrap()) == (original);
+        assert!(error.contains("reverted"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
         patcher.apply_edits_verified(&edit, None).unwrap();
-        let __ok5: bool = fs::read_to_string(&path).unwrap().starts_with("after\n");
+        assert!(fs::read_to_string(&path).unwrap().starts_with("after\n"));
         patcher.undo_with("large.txt", Some(&tag), false).unwrap();
-        let __ok6: bool = (fs::read_to_string(&path).unwrap()) == (original);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
         let missing = "0".repeat(32);
         let shape = FileShape { bom: String::new(), ending: LineEnding::Lf };
-        let __ok7: bool = patcher.restore_staged(&path, Some(&missing), &shape).is_err();
-        let __ok8: bool = (fs::read_to_string(&path).unwrap()) == (original);
+        assert!(patcher.restore_staged(&path, Some(&missing), &shape).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
-
-        let failed: Vec<&str> = [(__ok0, "original.len() > 1024 * 1024"), (__ok1, "read.contains(\"1:before\\n\") && read.len() < 1024"), (__ok2, "matches!(patcher.objects.resolve(&tag), Resolution::Found(_, body) if "), (__ok3, "{error}"), (__ok4, "fs::read_to_string(&path).unwrap() == original"), (__ok5, "fs::read_to_string(&path).unwrap().starts_with(\"after\\n\")"), (__ok6, "fs::read_to_string(&path).unwrap() == original"), (__ok7, "patcher.restore_staged(&path, Some(&missing), &shape).is_err()"), (__ok8, "fs::read_to_string(&path).unwrap() == original")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

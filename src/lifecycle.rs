@@ -295,17 +295,14 @@ mod tests {
         store.journal_record(&file_key, &tag).expect("journal");
         crate::objects::persist_workspace(&root, true, true);
         archive_repo(&root).expect("archive");
-        let __ok0: bool = store.journal_entries(&file_key).is_empty();
-        let __ok1: bool = restore(&root);
-        let __ok2: bool = (store.journal_entries(&file_key)) == (vec![tag.clone()]);
+        assert!(store.journal_entries(&file_key).is_empty());
+        assert!(restore(&root));
+        assert_eq!(store.journal_entries(&file_key), vec![tag.clone()]);
         let resolved = matches!(
             store.resolve(&tag),
             crate::objects::Resolution::Found(_, content) if content == "fn lifecycle_probe() {}"
         );
-        let __ok3: bool = resolved;
+        assert!(resolved);
         crate::objects::forget_workspace(&root);
-
-        let failed: Vec<&str> = [(__ok0, "store.journal_entries(&file_key).is_empty()"), (__ok1, "restore(&root)"), (__ok2, "store.journal_entries(&file_key) == vec![tag.clone()]"), (__ok3, "resolved")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 }

@@ -339,12 +339,9 @@ mod tests {
         let registry = SessionRegistry::new();
         let (a, _, _) = ready_parts(registry.open("codex", false, None).unwrap());
         let (b, _, _) = ready_parts(registry.open("codex", false, None).unwrap());
-        let __ok0: bool = (a) != (b);
-        let __ok1: bool = a.starts_with("codex.");
-        let __ok2: bool = (registry.count()) == (2);
-
-        let failed: Vec<&str> = [(__ok0, "same label must get distinct ids: {a} vs {b}"), (__ok1, "id carries the label: {a}"), (__ok2, "registry.count() == 2")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert_ne!(a, b, "same label must get distinct ids: {a} vs {b}");
+        assert!(a.starts_with("codex."), "id carries the label: {a}");
+        assert_eq!(registry.count(), 2);
     }
 
     #[test]
@@ -353,16 +350,13 @@ mod tests {
         let (id, token, _) = ready_parts(registry.open("agent", false, None).unwrap());
 
         let good = registry.open("agent", false, Some(Resume { session: id.clone(), token: token.clone() }));
-        let __ok0: bool = good.is_ok();
+        assert!(good.is_ok(), "correct token resumes: {good:?}");
 
         let bad = registry.open("agent", false, Some(Resume { session: id.clone(), token: "wrong".to_string() }));
-        let __ok1: bool = bad.is_err();
+        assert!(bad.is_err(), "wrong token is refused");
 
         let missing = registry.open("agent", false, Some(Resume { session: "ghost.0".to_string(), token }));
-        let __ok2: bool = missing.is_err();
-
-        let failed: Vec<&str> = [(__ok0, "correct token resumes: {good:?}"), (__ok1, "wrong token is refused"), (__ok2, "unknown session is refused")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert!(missing.is_err(), "unknown session is refused");
     }
 
     #[test]
@@ -380,12 +374,9 @@ mod tests {
         let (id, _, _) = ready_parts(registry.open("worker", false, None).unwrap());
         registry.begin(&id, &json!(1)).unwrap();
         registry.begin(&id, &json!(2)).unwrap();
-        let __ok0: bool = (registry.in_flight(&id)) == (2);
+        assert_eq!(registry.in_flight(&id), 2);
         registry.finish(&id, &json!(1)).unwrap();
-        let __ok1: bool = (registry.in_flight(&id)) == (1);
-
-        let failed: Vec<&str> = [(__ok0, "registry.in_flight(&id) == 2"), (__ok1, "registry.in_flight(&id) == 1")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
-        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
+        assert_eq!(registry.in_flight(&id), 1);
     }
 }
 pub fn builtin_profile(name: &str) -> Option<Policy> {
