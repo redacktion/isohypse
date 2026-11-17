@@ -1,3 +1,4 @@
+use crate::policy::{parse_stored, EnforceRequest, Enforcement};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -17,10 +18,27 @@ use crate::graph::watch;
 use crate::opresult::OpResult;
 use crate::patcher::Patcher;
 
+// Socket file *names* are all that is left of the old in-workspace layout. They
+// live inside a per-workspace run directory under the isohypse home, so a
+// running daemon leaves nothing whatsoever in the workspace.
 #[cfg(unix)]
-pub const SOCKET_NAME: &str = ".isohypse.sock";
+pub const SOCKET_NAME: &str = "daemon.sock";
 #[cfg(not(unix))]
-pub const SOCKET_NAME: &str = ".isohypse.port";
+pub const SOCKET_NAME: &str = "daemon.port";
+#[cfg(unix)]
+pub const SESSION_SOCKET_NAME: &str = "session.sock";
+#[cfg(not(unix))]
+pub const SESSION_SOCKET_NAME: &str = "session.port";
+/// Every socket name an older build wrote into a workspace, including the LSP
+/// socket and the Windows port marker. Removed once, at worker start.
+const LEGACY_SOCKET_NAMES: [&str; 5] = [
+    ".isohypse.sock",
+    ".isohypse.session.sock",
+    ".isohypse.sock.new",
+    ".isohypse.port",
+    ".isohypse-lsp.sock",
+];
+const RUN_DIR_ENV: &str = "ISOHYPSE_RUN_DIR";
 
 #[cfg(unix)]
 pub type DaemonStream = UnixStream;
@@ -73,16 +91,86 @@ fn signal_old_handover(canonical: &Path) {
     });
 }
 
+fn run_root() -> PathBuf {
+    if let Ok(overridden) = std::env::var(RUN_DIR_ENV) {
+        if !overridden.trim().is_empty() {
+            return PathBuf::from(overridden);
+        }
+    }
+    store_root().join("run")
+}
+
+fn workspace_key(root: &Path) -> String {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    blake3::hash(canonical.to_string_lossy().as_bytes()).to_hex().to_string()
+}
+
+/// The run directory name for a workspace: the first 16 hex characters of its
+/// key. A full blake3 key is 64 characters, and `<run>/<64-hex>/daemon.sock` is
+/// exactly 104 bytes, the `sun_path` limit on macOS. Truncating to 16 is the
+/// same cut `~/.omo/codegraph/projects/isohypse-4cdce2050af712fa` already makes.
+/// If another workspace ever owns the name, widen to 24, then 32.
+fn run_name(root: &Path) -> String {
+    let key = workspace_key(root);
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut width = 16;
+    loop {
+        let name = key[..width.min(key.len())].to_string();
+        match std::fs::read_link(run_root().join(&name).join("workspace")) {
+            Ok(recorded) if recorded != canonical && width < 32 => width += 8,
+            _ => return name,
+        }
+    }
+}
+
+/// Pure: computed, never created. `find_socket` walks ancestors with this, so it
+/// must not touch the filesystem beyond the stats it already makes.
+pub fn run_dir(root: &Path) -> PathBuf {
+    run_root().join(run_name(root))
+}
+
+/// Create the run directory and keep its `workspace` symlink pointing at the
+/// canonical root, so `ls -l ~/.isohypse/run` names every workspace without an
+/// isohypse command. Nothing is ever written *through* the link.
+pub fn ensure_run_dir(root: &Path) -> Result<PathBuf, String> {
+    let dir = run_dir(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let link = dir.join("workspace");
+    if std::fs::read_link(&link).ok().as_deref() != Some(canonical.as_path()) {
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&canonical, &link);
+    }
+    Ok(dir)
+}
+
 pub fn socket_path(root: &Path) -> PathBuf {
-    root.join(SOCKET_NAME)
+    run_dir(root).join(SOCKET_NAME)
 }
 
 pub fn session_socket_path(root: &Path) -> PathBuf {
-    root.join(".isohypse.session.sock")
+    run_dir(root).join(SESSION_SOCKET_NAME)
 }
 
+/// The session socket belonging beside a workspace socket. Callers that already
+/// found the daemon socket use this instead of re-deriving the root.
+pub fn session_socket_beside(socket: &Path) -> Option<PathBuf> {
+    socket.parent().map(|dir| dir.join(SESSION_SOCKET_NAME))
+}
+
+/// Discovery keeps its shape: walk ancestors from `start`, nearest first. What it
+/// looks for per level is the run directory keyed by that ancestor, not a socket
+/// file inside it. Canonicalize once, so a workspace reached through a symlink
+/// resolves to the same run directory the worker created.
 pub fn find_socket(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
+    let canonical = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let mut current: Option<&Path> = Some(canonical.as_path());
     while let Some(dir) = current {
         let candidate = socket_path(dir);
         if candidate.exists() {
@@ -90,7 +178,107 @@ pub fn find_socket(start: &Path) -> Option<PathBuf> {
         }
         current = dir.parent();
     }
+    let mut current: Option<&Path> = Some(canonical.as_path());
+    while let Some(dir) = current {
+        let candidate = dir.join(LEGACY_SOCKET_NAMES[0]);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = dir.parent();
+    }
     None
+}
+
+/// Remove the sockets older builds wrote into the workspace. This is the only
+/// thing isohypse ever deletes from a workspace.
+///
+/// One attempt is not enough: during a handover the predecessor is still draining
+/// when this worker starts, so its socket answers for another moment. Retry
+/// briefly, and never unlink a socket that answers.
+fn spawn_legacy_sweeper(root: PathBuf) {
+    std::thread::spawn(move || {
+        for _ in 0..30 {
+            let mut live = 0usize;
+            for name in LEGACY_SOCKET_NAMES {
+                let path = root.join(name);
+                // Only a socket is ours to remove. A regular file that happens to
+                // carry one of these names belongs to whoever put it there.
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if !meta.file_type().is_socket() {
+                        continue;
+                    }
+                }
+                if is_live(&path) {
+                    live += 1;
+                    continue;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    eprintln!("isohypse: removed legacy {name} from {}; sockets live under the isohypse home now", root.display());
+                }
+            }
+            if live == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+}
+
+/// The supervisor holds the instance lock and owns the run tree, so it is the
+/// only legitimate sweeper. A SIGKILL can leave a socket file that refuses
+/// connections, and a deleted workspace leaves a run directory pointing nowhere.
+/// Only what is provably dead is removed.
+fn sweep_run_dirs(roots: &[PathBuf]) {
+    // Known roots first, then every other directory in the run tree, each judged
+    // by its own workspace link: a run directory left behind by a workspace that
+    // was deleted is swept here even when nothing remembers that workspace.
+    let mut targets: Vec<(PathBuf, PathBuf)> = roots.iter().map(|root| (run_dir(root), root.clone())).collect();
+    if let Ok(entries) = std::fs::read_dir(run_root()) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() || targets.iter().any(|(known, _)| *known == dir) {
+                continue;
+            }
+            targets.push((dir.clone(), std::fs::read_link(dir.join("workspace")).unwrap_or_default()));
+        }
+    }
+    for (dir, root) in targets {
+        if !dir.exists() {
+            continue;
+        }
+        for name in [SOCKET_NAME, SESSION_SOCKET_NAME] {
+            let path = dir.join(name);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if !meta.file_type().is_socket() {
+                    continue;
+                }
+            }
+            if !is_live(&path) && std::fs::remove_file(&path).is_ok() {
+                eprintln!("sweep: removed dead {name} for {}", root.display());
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(".new") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        // A run directory with no workspace link at all, or one pointing at a
+        // root that no longer exists, has nothing left to serve.
+        if root.as_os_str().is_empty() || !root.exists() {
+            let _ = std::fs::remove_file(dir.join("workspace"));
+            if std::fs::remove_dir(&dir).is_ok() {
+                eprintln!("sweep: dropped the run directory for the missing workspace {}", dir.display());
+            }
+        }
+    }
 }
 
 pub fn is_live(socket: &Path) -> bool {
@@ -154,6 +342,8 @@ pub fn request(socket: &Path, payload: &Value) -> Result<String, String> {
             }
         }
     };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).map_err(|e| format!("cannot set daemon read timeout: {e}"))?;
+
     let mut line = payload.to_string();
     line.push('\n');
     stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
@@ -183,8 +373,63 @@ pub struct Workspace {
     pub build: Option<crate::buildspec::BuildSpec>,
     pub watcher_alive: bool,
     pub semantic_requested: bool,
+    pub reindexing: Arc<AtomicBool>,
     pub started: std::time::Instant,
     pub alive: Arc<AtomicBool>,
+    pub enforce: RwLock<Enforcement>,
+}
+
+impl Workspace {
+    pub fn check_enforce(&self, op: &str) -> Result<(), String> {
+        let state = self.enforce.read().map_err(|_| "enforce lock poisoned".to_string())?;
+        state.check(op).map_err(|refusal| refusal.to_string())
+    }
+
+    pub fn set_enforce(&self, request: EnforceRequest) -> Result<(), String> {
+        let mut state = self.enforce.write().map_err(|_| "enforce lock poisoned".to_string())?;
+        let next = state.apply(request).map_err(|refusal| refusal.to_string())?;
+        persist_enforce(&self.root, &next);
+        *state = next;
+        Ok(())
+    }
+}
+
+fn enforce_path(root: &Path) -> PathBuf {
+    let key = blake3::hash(root.to_string_lossy().as_bytes()).to_hex().to_string();
+    let dir = crate::objects::store_dir().join("enforce");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{key}.json"))
+}
+
+fn persist_enforce(root: &Path, state: &Enforcement) {
+    if let Enforcement::Active(policy) = state {
+        let _ = crate::objects::write_private(&enforce_path(root), &serde_json::to_vec(&policy.to_wire()).unwrap_or_default());
+    }
+}
+
+pub fn clear_all_enforcement() {
+    clear_enforcement_in(&crate::objects::store_dir().join("enforce"));
+}
+
+/// Remove every persisted policy file in `dir`.
+pub fn clear_enforcement_in(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub fn load_enforce(root: &Path) -> Enforcement {
+    let path = enforce_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(String::new()),
+    };
+    parse_stored(text.as_deref()).into_enforcement()
 }
 
 #[cfg(unix)]
@@ -249,10 +494,14 @@ pub fn peer_ok(fd: std::os::unix::io::RawFd) -> bool {
 }
 
 fn verify_account_password(password: &str) -> bool {
-    let Ok(user) = std::env::var("USER") else { return false };
+    let Ok(identity) = std::process::Command::new("/usr/bin/id").arg("-un").output() else { return false };
+    if !identity.status.success() { return false; }
+    let Ok(user) = std::str::from_utf8(&identity.stdout) else { return false };
+    let user = user.trim();
+    if user.is_empty() { return false; }
     use std::io::Write;
     let Ok(mut child) = std::process::Command::new("/usr/bin/dscl")
-        .args([".", "-authonly", &user])
+        .args([".", "-authonly", user])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -334,8 +583,34 @@ impl Registry {
     }
 }
 
+/// Resident set size, in bytes. The memory ceiling (tool spec §4) needs the same
+/// number PANOPTCN watches, so this helper is not measurement-only.
+fn rss_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("/bin/ps").args(["-o", "rss=", "-p", &pid]).output().ok()?;
+    let kb: u64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    Some(kb * 1024)
+}
+
+fn measure_enabled() -> bool {
+    std::env::var("ISOHYPSE_MEASURE").as_deref() == Ok("1")
+}
+
+/// Phase boundary sample for `build_workspace`. Gated so a normal run logs nothing.
+fn measure(label: &str) {
+    if !measure_enabled() {
+        return;
+    }
+    if let Some(bytes) = rss_bytes() {
+        println!("measure: pid={} {label} rss_mb={:.1}", std::process::id(), bytes as f64 / (1024.0 * 1024.0));
+    }
+}
+
+
 pub fn build_workspace(registry: &Arc<Registry>, root: PathBuf) -> Result<Arc<Workspace>, String> {
     crate::lifecycle::restore(&root);
+    measure("entry");
+
     crate::machine::ensure()?;
     crate::objects::migrate_store()?;
     let socket = socket_path(&root);
@@ -346,18 +621,24 @@ pub fn build_workspace(registry: &Arc<Registry>, root: PathBuf) -> Result<Arc<Wo
         "indexed {} files ({} extracted, {} unreadable), {} symbols",
         summary.files, summary.extracted, summary.skipped, summary.symbols
     );
+    measure("after full_index");
+
     let index = Arc::new(Mutex::new(index));
     let watcher = watch::spawn(Arc::clone(&index), root.clone(), Arc::clone(&registry.sessions), root.to_string_lossy().into_owned());
     let watcher_alive = watcher.is_ok();
     if let Ok(active) = watcher {
         std::mem::forget(active);
     }
+    measure("after watcher");
+
     let refs = if registry.lsp {
         eprintln!("precise refs: stack-graph overlay building for python/javascript/typescript/java");
         Some(crate::refs::PreciseIndex::spawn(root.clone(), Arc::clone(&registry.sessions), root.to_string_lossy().into_owned()))
     } else {
         None
     };
+    measure("after refs spawn");
+
     let semantic: Arc<Mutex<Option<crate::semantic::SemanticIndex>>> = Arc::new(Mutex::new(None));
     if registry.semantic {
         let slot = Arc::clone(&semantic);
@@ -380,6 +661,9 @@ pub fn build_workspace(registry: &Arc<Registry>, root: PathBuf) -> Result<Arc<Wo
             }
         });
     }
+    measure("after semantic spawn");
+
+    let persisted_enforce = load_enforce(&root);
     let workspace = Arc::new(Workspace {
         refs,
         semantic,
@@ -391,12 +675,29 @@ pub fn build_workspace(registry: &Arc<Registry>, root: PathBuf) -> Result<Arc<Wo
         build,
         watcher_alive,
         semantic_requested: registry.semantic,
+        reindexing: Arc::new(AtomicBool::new(false)),
         started: std::time::Instant::now(),
         alive: Arc::new(AtomicBool::new(true)),
+        enforce: RwLock::new(persisted_enforce),
     });
     registry.insert(Arc::clone(&workspace));
     spawn_session_listener(registry, &workspace);
     crate::objects::persist_workspace(&workspace.root, registry.lsp, registry.semantic);
+    if measure_enabled() {
+        measure("ready");
+        // refs and semantic build on detached threads, so their footprint lands
+        // after this function returns. Sample forward to attribute it.
+        let label = workspace.root.to_string_lossy().into_owned();
+        std::thread::spawn(move || {
+            for step in 1..=10u64 {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if let Some(bytes) = rss_bytes() {
+                    println!("measure: pid={} +{}s rss_mb={:.1} {label}", std::process::id(), step * 30, bytes as f64 / (1024.0 * 1024.0));
+                }
+            }
+        });
+    }
+
     Ok(workspace)
 }
 
@@ -445,6 +746,26 @@ fn spawn_session_listener(registry: &Arc<Registry>, workspace: &Arc<Workspace>) 
     });
 }
 
+/// Cap concurrent workspace-socket handlers. Each accepted connection owns a
+/// thread that blocks on its client, so an unbounded accept loop turns a few
+/// stalled clients into thread exhaustion. Over-capacity clients get an explicit
+/// one-line refusal instead of an unbounded queue.
+static WORKSPACE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_WORKSPACE_CONNECTIONS: usize = 64;
+const WORKSPACE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn release_workspace_connection() {
+    WORKSPACE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// `kill(pid, 0)` succeeds for a zombie, so liveness alone never authorizes a
+/// fallback; callers confirm the socket as well.
+fn pid_alive(pid: u32) -> bool {
+    pid > 1 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+}
+
+
+
 fn serve_workspace(registry: Arc<Registry>, workspace: Arc<Workspace>) -> Result<(), String> {
     let listener = if HANDOVER_MODE.load(Ordering::SeqCst) {
         let staging = staging_socket(&workspace.socket);
@@ -466,11 +787,24 @@ fn serve_workspace(registry: Arc<Registry>, workspace: Arc<Workspace>) -> Result
         if !workspace.alive.load(Ordering::Relaxed) {
             break;
         }
+        if WORKSPACE_CONNECTIONS.fetch_add(1, Ordering::AcqRel) >= MAX_WORKSPACE_CONNECTIONS {
+            release_workspace_connection();
+            let _ = (&stream).write_all(b"{\"ok\":false,\"error\":\"workspace socket is at capacity; retry shortly\"}\n");
+            continue;
+        }
+        // A client that connects and stalls must not hold this thread forever.
+        let _ = stream.set_read_timeout(Some(WORKSPACE_IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(WORKSPACE_IO_TIMEOUT));
         let registry = Arc::clone(&registry);
         let workspace = Arc::clone(&workspace);
-        std::thread::spawn(move || serve_one(stream, &workspace, &registry));
+        std::thread::spawn(move || {
+            serve_one(stream, &workspace, &registry);
+            release_workspace_connection();
+        });
     }
-    if !SUPERSEDED.load(Ordering::SeqCst) {
+    // A dead socket file is what makes a live daemon look absent, so drop the one
+    // we were serving unless a replacement already answers on it.
+    if !is_live(&workspace.socket) {
         let _ = std::fs::remove_file(&workspace.socket);
     }
     Ok(())
@@ -501,6 +835,50 @@ fn services_socket() -> PathBuf {
     });
     let _ = std::fs::create_dir_all(&base);
     base.join("services.sock")
+}
+
+/// Password-authorized recovery when the supervisor cannot accept control RPCs.
+/// Identify the process through its open instance lock, never a PID file.
+#[cfg(target_os = "macos")]
+pub fn recover_supervisor(password: &str) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let lock = supervisor_socket().with_extension("instance.lock");
+    let metadata = std::fs::symlink_metadata(&lock).map_err(|e| format!("supervisor recovery: {e}"))?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err("supervisor recovery refused: unsafe instance lock".into());
+    }
+    if password.is_empty() || !verify_account_password(password) {
+        return Err("supervisor recovery requires the operator account password".into());
+    }
+    let owner = || -> Result<libc::pid_t, String> {
+        let output = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-t", "-a", "-u", &unsafe { libc::geteuid() }.to_string()])
+            .arg(&lock).output().map_err(|e| e.to_string())?;
+        let pids: BTreeSet<libc::pid_t> = String::from_utf8_lossy(&output.stdout)
+            .lines().filter_map(|line| line.parse().ok()).collect();
+        if pids.len() != 1 { return Err("supervisor recovery refused: no unique instance-lock owner".into()); }
+        Ok(*pids.first().unwrap())
+    };
+    let pid = owner()?;
+    if pid <= 1 || unsafe { libc::getpgid(pid) } != pid || !crate::trust::process_signature_ok(pid) {
+        return Err("supervisor recovery refused: process identity or code-signature verification failed".into());
+    }
+    // Recheck the lock owner after identity verification; never signal a process
+    // selected only by its name or a stale on-disk PID.
+    if owner()? != pid { return Err("supervisor changed during recovery; nothing stopped".into()); }
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 { return Err(std::io::Error::last_os_error().to_string()); }
+    for _ in 0..100 {
+        if unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Ok("authenticated supervisor recovery completed; run state up to restart\n".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("supervisor did not exit within 10 seconds; no forced kill attempted".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn recover_supervisor(_password: &str) -> Result<String, String> {
+    Err("authenticated supervisor recovery is supported on macOS only".into())
 }
 
 pub fn services_reachable() -> Option<PathBuf> {
@@ -768,14 +1146,15 @@ fn scrub_injection_env(command: &mut std::process::Command) {
 }
 
 fn spawn_services(supervisor: &Arc<Supervisor>) {
-    let mut command = std::process::Command::new(&supervisor.exe);
+    let executable = supervisor.exe.lock().map(|path| path.clone()).unwrap_or_else(|_| PathBuf::from("isohypse"));
+    let mut command = std::process::Command::new(executable);
     command.arg("services");
     scrub_injection_env(&mut command);
     command.env_remove("ISOHYPSE_HANDOVER");
     if HANDOVER_MODE.load(Ordering::SeqCst) {
         command.env("ISOHYPSE_HANDOVER", "1");
     }
-    if supervisor.semantic {
+    if supervisor.semantic.lock().map(|value| *value).unwrap_or(false) {
         command.arg("--semantic");
     }
     let child = match command.spawn() {
@@ -828,6 +1207,56 @@ fn install_supervisor_signals(socket: &Path) {
 #[cfg(not(unix))]
 fn install_supervisor_signals(_socket: &Path) {}
 
+/// Release the instance lock and stand by, then retire once a successor has
+/// promoted the control socket. The lock is acquired at supervisor startup, so
+/// it has to be free before the replacement is launched.
+fn begin_retirement(supervisor: &Arc<Supervisor>) {
+    if supervisor.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(mut lock) = supervisor.instance_lock.lock() {
+        *lock = None;
+    }
+    let supervisor = Arc::clone(supervisor);
+    std::thread::spawn(move || {
+        use std::os::unix::fs::MetadataExt;
+        let own = supervisor.own_inode.load(Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let promoted = std::fs::metadata(supervisor_socket())
+                .map(|meta| meta.ino())
+                .ok()
+                != Some(own);
+            if promoted {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // No successor took over; keep serving rather than leaving
+                // every workspace without a supervisor.
+                supervisor.shutting_down.store(false, Ordering::SeqCst);
+                eprintln!("supervisor: no successor promoted the control socket; continuing to serve");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // Let the successor's workers finish taking over the workspace sockets,
+        // then retire whatever remains in this process group.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        unsafe {
+            libc::killpg(0, libc::SIGKILL);
+        }
+    });
+}
+
+/// Ask a running supervisor to free the instance lock and stand by, so a
+/// replacement can start and warm its workers before taking the sockets over.
+pub fn supersede_supervisor() {
+    if let Some(control) = supervisor_reachable() {
+        let _ = request(&control, &json!({"op": "supersede"}));
+    }
+}
+
+
 fn signal_old_supervisor_retire() {
     let control = supervisor_socket();
     if is_live(&control) {
@@ -852,11 +1281,10 @@ pub fn run_services(eager: bool) -> Result<(), String> {
         });
     }
     std::thread::spawn(|| {
-        let (converted, saved, reaped) = crate::objects::compact_objects();
-        if converted > 0 || reaped > 0 {
+        let reaped = crate::objects::compact_objects();
+        if reaped > 0 {
             eprintln!(
-                "services: compacted {converted} object(s), saved {} KiB, reaped {reaped} dead entr(ies)",
-                saved / 1024
+                "services: reaped {reaped} dead object entr(ies)"
             );
         }
         loop {
@@ -1001,23 +1429,43 @@ fn fanout_workers(payload: &Value) -> Value {
 }
 
 struct Supervisor {
-    exe: PathBuf,
-    lsp: bool,
-    semantic: bool,
+    exe: Mutex<PathBuf>,
+    lsp: Mutex<bool>,
+    semantic: Mutex<bool>,
     shutting_down: AtomicBool,
     workers: Mutex<std::collections::HashMap<PathBuf, u32>>,
     crashes: Mutex<std::collections::HashMap<PathBuf, (u32, std::time::Instant)>>,
+    /// Worker being replaced by an overlapped handover. It keeps serving until
+    /// the replacement promotes the socket, so a failed warm-up can fall back.
+    superseded: Mutex<std::collections::HashMap<PathBuf, u32>>,
+    /// Inode of the control socket this supervisor bound. A retiring supervisor
+    /// compares it against the live path to detect a successor's promotion.
+    own_inode: std::sync::atomic::AtomicU64,
+    /// Held while this supervisor is live; released at handover so a successor
+    /// can acquire it before the old group is torn down.
+    instance_lock: Mutex<Option<std::fs::File>>,
+
+
 }
 
 impl Supervisor {
     fn spawn_worker(self: &Arc<Self>, root: PathBuf, handover: bool) {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
-        let mut command = std::process::Command::new(&self.exe);
+        // Stateful handover: the replacement builds its index while the current
+        // worker keeps serving, and only then takes over the socket. Killing
+        // first would leave the workspace cold for the entire rebuild.
+        let previous = if handover {
+            self.workers.lock().ok().and_then(|workers| workers.get(&root).copied())
+        } else {
+            None
+        };
+        let executable = self.exe.lock().map(|path| path.clone()).unwrap_or_else(|_| PathBuf::from("isohypse"));
+        let mut command = std::process::Command::new(executable);
         command.arg("worker").arg(&root);
-        if self.lsp {
+        if self.lsp.lock().map(|value| *value).unwrap_or(false) {
             command.arg("--lsp");
         }
-        if self.semantic {
+        if self.semantic.lock().map(|value| *value).unwrap_or(false) {
             command.arg("--semantic");
         }
         scrub_injection_env(&mut command);
@@ -1036,6 +1484,11 @@ impl Supervisor {
         if let Ok(mut workers) = self.workers.lock() {
             workers.insert(root.clone(), pid);
         }
+        if let Some(previous) = previous {
+            if let Ok(mut superseded) = self.superseded.lock() {
+                superseded.insert(root.clone(), previous);
+            }
+        }
         let supervisor = Arc::clone(self);
         std::thread::spawn(move || {
             let mut child = child;
@@ -1049,6 +1502,26 @@ impl Supervisor {
             if !still_ours || supervisor.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
+            // A replacement that exits before promoting must not strand the
+            // workspace: keep the worker that is still serving its socket.
+            let fallen_back = supervisor
+                .superseded
+                .lock()
+                .ok()
+                .and_then(|mut entries| entries.remove(&root));
+            if let Some(previous) = fallen_back {
+                if previous != pid
+                    && pid_alive(previous)
+                    && !matches!(probe_worker(&socket_path(&root)), Probe::Unreachable)
+                {
+                    if let Ok(mut workers) = supervisor.workers.lock() {
+                        workers.insert(root.clone(), previous);
+                    }
+                    eprintln!("supervisor: replacement for {} exited before takeover; kept the running worker", root.display());
+                    return;
+                }
+            }
+
             if let Ok(mut workers) = supervisor.workers.lock() {
                 if workers.get(&root).copied() == Some(pid) {
                     workers.remove(&root);
@@ -1056,6 +1529,14 @@ impl Supervisor {
             }
             if supervisor.crash_looping(&root) {
                 eprintln!("supervisor: worker for {} is crash-looping; not restarting", root.display());
+                return;
+            }
+            // A refused root exits every time by design: never re-spawn it.
+            if !crate::graph::resolve::is_workspace_root(&root) {
+                eprintln!(
+                    "supervisor: {} is not an indexable workspace; leaving it stopped",
+                    root.display()
+                );
                 return;
             }
             eprintln!("supervisor: worker for {} exited; restarting", root.display());
@@ -1085,7 +1566,7 @@ impl Supervisor {
         match pid {
             Some(pid) => {
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
                 }
                 true
             }
@@ -1124,6 +1605,12 @@ fn spawn_orphan_guard(socket: PathBuf) {
 }
 
 pub fn run_worker(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) -> Result<(), String> {
+    if !crate::graph::resolve::is_workspace_root(&root) {
+        return Err(format!(
+            "{} is a home directory or filesystem root, not a workspace: refusing to index the whole disk",
+            root.display()
+        ));
+    }
     let handover = std::env::var_os("ISOHYPSE_HANDOVER").is_some();
     HANDOVER_MODE.store(handover, Ordering::SeqCst);
     let socket = socket_path(&root);
@@ -1133,6 +1620,11 @@ pub fn run_worker(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) -> R
     if !handover {
         let _ = std::fs::remove_file(&socket);
     }
+    // The run directory holds every socket this workspace will use. Legacy
+    // in-workspace sockets are unlinked once, and only when nothing answers on
+    // them: an incumbent worker mid-handover may still be serving one.
+    ensure_run_dir(&root)?;
+    spawn_legacy_sweeper(root.clone());
     let registry = Registry::new(lsp_enabled, semantic_enabled);
     let workspace = build_workspace(&registry, root)?;
     install_signal_cleanup(&workspace.socket);
@@ -1145,18 +1637,38 @@ pub fn run_worker(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) -> R
 pub fn run_supervisor(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) -> Result<(), String> {
     let handover = std::env::var_os("ISOHYPSE_HANDOVER").is_some();
     HANDOVER_MODE.store(handover, Ordering::SeqCst);
-    let control = supervisor_socket();
+let control = supervisor_socket();
+    #[cfg(unix)]
+    let supervisor_instance_lock = {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = control.with_extension("instance.lock");
+        let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&lock_path)
+            .map_err(|e| format!("cannot open supervisor instance lock: {e}"))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err("a supervisor instance is already live; refusing to create a duplicate".to_string());
+        }
+        file
+    };
+    if handover && !is_live(&control) && is_live(&socket_path(&root)) {
+        return Err("refusing reload: workspace daemon is live but its supervisor is unreachable; refusing to create a duplicate supervisor".to_string());
+    }
     if !handover && is_live(&control) {
         return Err(format!("a supervisor is already live on {}", control.display()));
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let supervisor = Arc::new(Supervisor {
-        exe,
-        lsp: lsp_enabled,
-        semantic: semantic_enabled,
+        exe: Mutex::new(exe),
+        lsp: Mutex::new(lsp_enabled),
+        semantic: Mutex::new(semantic_enabled),
         shutting_down: AtomicBool::new(false),
         workers: Mutex::new(std::collections::HashMap::new()),
         crashes: Mutex::new(std::collections::HashMap::new()),
+        superseded: Mutex::new(std::collections::HashMap::new()),
+        own_inode: std::sync::atomic::AtomicU64::new(0),
+        instance_lock: Mutex::new(Some(supervisor_instance_lock)),
+
+
     });
     install_supervisor_signals(&control);
     if handover {
@@ -1172,13 +1684,23 @@ pub fn run_supervisor(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) 
             continue;
         }
         let canonical = std::fs::canonicalize(&persisted_root).unwrap_or(persisted_root);
+        // A persisted home directory or filesystem root can never be indexed.
+        if !crate::graph::resolve::is_workspace_root(&canonical) {
+            crate::objects::forget_workspace(&canonical);
+            continue;
+        }
         if !roots.contains(&canonical) {
             roots.push(canonical);
         }
     }
+    // The supervisor owns the run tree: clear dead sockets, staging leftovers,
+    // and run directories whose workspace is gone before any worker starts.
+    sweep_run_dirs(&roots);
     for workspace_root in roots {
         supervisor.spawn_worker(workspace_root, handover);
     }
+    spawn_worker_watchdog(&supervisor);
+
     let listener = if handover {
         let staging = staging_socket(&control);
         let _ = std::fs::remove_file(&staging);
@@ -1189,6 +1711,14 @@ pub fn run_supervisor(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) 
     } else {
         bind_listener(&control)?
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(&control) {
+            supervisor.own_inode.store(meta.ino(), Ordering::SeqCst);
+        }
+    }
+
     HANDOVER_MODE.store(false, Ordering::SeqCst);
     println!("supervisor on {}", control.display());
     for stream in listener.incoming() {
@@ -1198,6 +1728,84 @@ pub fn run_supervisor(root: PathBuf, lsp_enabled: bool, semantic_enabled: bool) 
     }
     Ok(())
 }
+
+/// A wedged worker is worse than a dead one: the supervisor only replaces
+/// children that exit. Probe every workspace and replace a worker that misses
+/// consecutive deadlines so a locked socket recovers without operator action.
+const WORKER_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const WORKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const WORKER_PROBE_MISSES: u32 = 5;
+
+enum Probe {
+    /// The worker answered.
+    Answered,
+    /// The worker accepted the connection but is still working. A large workspace
+    /// can spend minutes indexing, so this is health, not a wedge. Treating it as
+    /// failure kills a working worker, whose cold re-index misses again.
+    Busy,
+    /// Nothing is listening; only this counts as a miss.
+    Unreachable,
+}
+
+fn probe_worker(socket: &Path) -> Probe {
+    let Ok(mut stream) = connect_endpoint(socket) else { return Probe::Unreachable };
+    let _ = stream.set_read_timeout(Some(WORKER_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WORKER_PROBE_TIMEOUT));
+    if stream.write_all(b"{\"op\":\"state.status\"}\n").is_err() {
+        return Probe::Unreachable;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(n) if n > 0 => Probe::Answered,
+        // Connected, so the accept loop is alive. Slow is not wedged.
+        _ => Probe::Busy,
+    }
+}
+
+fn spawn_worker_watchdog(supervisor: &Arc<Supervisor>) {
+    let supervisor = Arc::clone(supervisor);
+    std::thread::spawn(move || {
+        let mut misses: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
+        loop {
+            std::thread::sleep(WORKER_PROBE_INTERVAL);
+            if supervisor.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            for root in supervisor.roots() {
+                if supervisor.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                let live = supervisor.workers.lock().map(|workers| workers.contains_key(&root)).unwrap_or(false);
+                if !live {
+                    misses.remove(&root);
+                    continue;
+                }
+                match probe_worker(&socket_path(&root)) {
+                    Probe::Answered | Probe::Busy => {
+                        misses.remove(&root);
+                        continue;
+                    }
+                    Probe::Unreachable => {}
+                }
+                let count = misses.entry(root.clone()).or_insert(0);
+                *count += 1;
+                if *count < WORKER_PROBE_MISSES {
+                    continue;
+                }
+                misses.remove(&root);
+                eprintln!("supervisor: worker for {} is unreachable; replacing it", root.display());
+                // Nothing is listening, so there is no session left to preserve and
+                // no worker that can hand over: retire the process outright rather
+                // than spawning a second one beside it.
+                supervisor.kill_worker(&root);
+                supervisor.spawn_worker(root.clone(), false);
+            }
+        }
+    });
+}
+
+
 
 fn serve_supervisor_one(stream: DaemonStream, supervisor: &Arc<Supervisor>) {
     {
@@ -1237,15 +1845,9 @@ fn serve_supervisor_one(stream: DaemonStream, supervisor: &Arc<Supervisor>) {
                     }
                     std::process::exit(0);
                 }
-                "retire" => {
-                    supervisor.shutting_down.store(true, Ordering::SeqCst);
+                "retire" | "supersede" => {
                     let _ = (&stream).write_all(b"{\"ok\":true,\"output\":\"supervisor retiring\\n\"}\n");
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(8));
-                        unsafe {
-                            libc::killpg(0, libc::SIGKILL);
-                        }
-                    });
+                    begin_retirement(supervisor);
                     return;
                 }
                 "spawn" => match root_arg() {
@@ -1272,10 +1874,30 @@ fn serve_supervisor_one(stream: DaemonStream, supervisor: &Arc<Supervisor>) {
                     None => json!({"ok": false, "error": "kill needs a root"}),
                 },
                 "reload" => {
-                    for root in supervisor.roots() {
-                        supervisor.spawn_worker(root, true);
+                    if let Some(raw) = payload.get("exe").and_then(Value::as_str) {
+                        let candidate = PathBuf::from(raw);
+                        let current = supervisor.exe.lock().map(|path| path.clone()).unwrap_or_default();
+                        let same_path = candidate.canonicalize().ok() == current.canonicalize().ok();
+                        let staged_sibling = candidate.parent() == current.parent() && candidate.file_name().map(|name| name.to_string_lossy().starts_with("isohypse.build-")).unwrap_or(false);
+                        if !same_path && !staged_sibling {
+                            json!({"ok": false, "error": "reload executable must be the current binary or a staged sibling in the same directory"})
+                        } else {
+                            if let Ok(mut current) = supervisor.exe.lock() { *current = candidate; }
+                            if let Some(value) = payload.get("lsp").and_then(Value::as_bool) {
+                                if let Ok(mut setting) = supervisor.lsp.lock() { *setting = value; }
+                            }
+                            if let Some(value) = payload.get("semantic").and_then(Value::as_bool) {
+                                if let Ok(mut setting) = supervisor.semantic.lock() { *setting = value; }
+                            }
+                            let executable = supervisor.exe.lock().map(|path| path.display().to_string()).unwrap_or_else(|_| "unknown".to_string());
+                            for root in supervisor.roots() { supervisor.spawn_worker(root, true); }
+                            json!({"ok": true, "output": format!("supervisor reloading workers with {executable}\n")})
+                        }
+                    } else {
+                        let executable = supervisor.exe.lock().map(|path| path.display().to_string()).unwrap_or_else(|_| "unknown".to_string());
+                        for root in supervisor.roots() { supervisor.spawn_worker(root, true); }
+                        json!({"ok": true, "output": format!("supervisor reloading workers with {executable}\n")})
                     }
-                    json!({"ok": true, "output": "supervisor reloading workers\n"})
                 }
                 "list" | "status" => {
                     let roots = supervisor.roots();
@@ -1323,7 +1945,7 @@ pub fn serve_one(stream: DaemonStream, context: &Workspace, registry: &Arc<Regis
                 }
                 for workspace in registry.snapshot() {
                     let _ = std::fs::remove_file(&workspace.socket);
-                    crate::objects::runtime_unregister(&workspace.root);
+                    crate::objects::runtime_unregister_if(&workspace.root, &workspace.socket);
                 }
                 let _ = std::fs::remove_file(&context.socket);
                 std::process::exit(0);
@@ -1333,6 +1955,10 @@ pub fn serve_one(stream: DaemonStream, context: &Workspace, registry: &Arc<Regis
                 let _ = (&stream).write_all(b"{\"ok\":true,\"output\":\"handover accepted\\n\"}\n");
                 let registry = Arc::clone(registry);
                 std::thread::spawn(move || {
+                    // Hold the retiring listener briefly so the successor can
+                    // promote the socket path; no client should observe a gap.
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     loop {
                         let idle = registry.snapshot().iter().all(|ws| ws.apply_queue.try_lock().is_ok());
@@ -1345,15 +1971,19 @@ pub fn serve_one(stream: DaemonStream, context: &Workspace, registry: &Arc<Regis
                 });
                 return;
             }
-            let selector = payload.get("workspace").and_then(Value::as_str);
-            crate::objects::touch_workspace(&context.root);
-            let outcome = dispatch_op(op, &payload, context, registry, selector);
-            match outcome {
-                Ok(result) => json!({"ok": true, "output": result.render(), "json": result.to_json()}),
-                Err(error) => json!({"ok": false, "error": error}),
+            if matches!(op, "state.status" | "state.up") {
+                let selector = payload.get("workspace").and_then(Value::as_str);
+                crate::objects::touch_workspace(&context.root);
+                let outcome = dispatch_op(op, &payload, context, registry, selector);
+                match outcome {
+                    Ok(result) => json!({"ok": true, "output": result.render(), "json": result.to_json()}),
+                    Err(error) => json!({"ok": false, "error": crate::opresult::failure_json("daemon", None, Some(op), None, None, Some(&error), None, None, None)}),
+                }
+            } else {
+                json!({"ok": false, "error": format!("op {op:?} is not available on the workspace socket; use session --stdio")})
             }
         }
-        Err(e) => json!({"ok": false, "error": format!("malformed request: {e}")}),
+        Err(e) => json!({"ok": false, "error": crate::opresult::failure_json("daemon-wrapper", None, None, None, None, Some(&format!("malformed request: {e}")), None, None, None)}),
     };
     let mut out = response.to_string();
     out.push('\n');
@@ -1374,14 +2004,42 @@ fn dispatch_op(
     registry: &Arc<Registry>,
     selector: Option<&str>,
 ) -> Result<Box<dyn OpResult>, String> {
-    match selector {
-        None | Some("") | Some(".") => run_op(op, payload, context),
+    dispatch_op_cancelable(op, payload, context, registry, selector, None)
+}
+
+fn dispatch_op_cancelable(
+    op: &str,
+    payload: &Value,
+    context: &Workspace,
+    registry: &Arc<Registry>,
+    selector: Option<&str>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Box<dyn OpResult>, String> {
+    if cancelled.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) {
+        return Err("command cancelled before execution".to_string());
+    }
+    if matches!(op, "context.find" | "context.explore") {
+        if let Some(max) = payload.get("max").and_then(Value::as_u64) {
+            let ceiling = if op == "context.find" { 256 } else { 128 };
+            if max == 0 || max > ceiling {
+                return Err(format!("{op} max must be between 1 and {ceiling}"));
+            }
+        }
+    }
+
+    let previous_cancel = crate::patcher::set_thread_cancel_token(cancelled.clone());
+    let result = match selector {
+        None | Some("") | Some(".") => {
+            if op == "multi-op" { multi_op(context, payload, cancelled).map(into_boxed) } else { run_op(op, payload, context) }
+        }
         Some("*") => fan_out(op, payload, registry).map(into_boxed),
         Some(sel) => {
             let target = resolve_workspace(registry, sel)?;
             run_op(op, payload, &target)
         }
-    }
+    };
+    let _ = crate::patcher::set_thread_cancel_token(previous_cancel);
+    result
 }
 
 fn into_boxed<T: OpResult + 'static>(value: T) -> Box<dyn OpResult> {
@@ -1399,10 +2057,56 @@ impl crate::serve::Dispatcher for SessionDispatcher {
         let result = dispatch_op(op, payload, &self.context, &self.registry, workspace)?;
         Ok((result.render(), result.to_json()))
     }
+
+    fn dispatch_cancelable(&self, op: &str, workspace: Option<&str>, payload: &Value, cancelled: Arc<std::sync::atomic::AtomicBool>) -> Result<(String, Value), String> {
+        crate::objects::touch_workspace(&self.context.root);
+        let result = dispatch_op_cancelable(op, payload, &self.context, &self.registry, workspace, Some(cancelled))?;
+        Ok((result.render(), result.to_json()))
+    }
+
+    fn check_enforce(&self, op: &str) -> Result<(), String> {
+        self.context.check_enforce(op)
+    }
+
+    fn set_enforce(&self, request: EnforceRequest) -> Result<(), String> {
+        self.context.set_enforce(request)
+    }
 }
 
 fn arg_str(payload: &Value) -> &str {
     payload.get("arg").and_then(Value::as_str).unwrap_or_default()
+}
+
+fn ndjson_read_chunks(path: &str, rendered: &str) -> String {
+    let mut tag = "";
+    let mut seq = 0u64;
+    let mut out = String::new();
+    for line in rendered.lines() {
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some((_, value)) = line[1..line.len() - 1].rsplit_once('#') {
+                tag = value;
+            }
+            continue;
+        }
+        let (start, text) = line
+            .split_once(':')
+            .and_then(|(number, text)| number.parse::<usize>().ok().map(|n| (n, text)))
+            .unwrap_or((0, line));
+        seq += 1;
+        out.push_str(&json!({
+            "path": path,
+            "tag": tag,
+            "start": start,
+            "end": start,
+            "seq": seq,
+            "text": text,
+            "eof": false
+        }).to_string());
+        out.push('\n');
+    }
+    out.push_str(&json!({"path": path, "tag": tag, "seq": seq + 1, "eof": true}).to_string());
+    out.push('\n');
+    out
 }
 
 fn run_op(op: &str, payload: &Value, ws: &Workspace) -> Result<Box<dyn OpResult>, String> {
@@ -1433,17 +2137,34 @@ fn run_op(op: &str, payload: &Value, ws: &Workspace) -> Result<Box<dyn OpResult>
                 Err(crate::buildspec::render(&outcome))
             }
         }
-        "multi-op" => multi_op(ws, payload).map(into_boxed),
+        "multi-op" => multi_op(ws, payload, None).map(into_boxed),
         "context.prompt" => Ok(into_boxed(crate::prompt::FORMAT_REFERENCE.to_string())),
         "state.up" => {
             if payload.get("reindex").and_then(Value::as_bool) != Some(true) {
-                return Err("state.up runs from the CLI; in a session, pass {\"reindex\":true} to rebuild this workspace".to_string());
+                return Err("state.up runs from the CLI; in a session, pass reindex=true to rebuild this workspace".to_string());
             }
-            let summary = ws.index.lock().map_err(|_| "index poisoned".to_string())?.full_index();
-            Ok(into_boxed(format!(
-                "indexed {} files ({} extracted, {} unreadable), {} symbols\n",
-                summary.files, summary.extracted, summary.skipped, summary.symbols
-            )))
+            if ws.reindexing.swap(true, Ordering::AcqRel) {
+                return Ok(into_boxed("reindex already running\n".to_string()));
+            }
+            let index = Arc::clone(&ws.index);
+            let reindexing = Arc::clone(&ws.reindexing);
+            let root = ws.root.clone();
+            let cancel_token = crate::patcher::thread_cancel_token();
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    index.lock().map_err(|_| "index poisoned".to_string()).and_then(|mut index| index.full_index_cancelable(cancel_token.as_deref()))
+                }));
+                match result {
+                    Ok(Ok(summary)) => eprintln!(
+                        "reindex: {} indexed files ({} extracted, {} unreadable, {} over the size cap), {} symbols",
+                        summary.files, summary.extracted, summary.skipped, summary.oversized, summary.symbols
+                    ),
+                    Ok(Err(error)) => eprintln!("reindex failed for {}: {error}", root.display()),
+                    Err(_) => eprintln!("reindex panicked for {}", root.display()),
+                }
+                reindexing.store(false, Ordering::Release);
+            });
+            Ok(into_boxed("reindex started\n".to_string()))
         }
         "state.get" => fetch_object(query).map(into_boxed),
         "state.put" => store_object(query).map(into_boxed),
@@ -1452,9 +2173,14 @@ fn run_op(op: &str, payload: &Value, ws: &Workspace) -> Result<Box<dyn OpResult>
         "macro.run" => macro_run(ws, payload).map(into_boxed),
         "macro.list" => list_macros().map(into_boxed),
         "context.read" => {
+            if payload.get("tag").is_some() {
+                return crate::history::read(&ws.root, payload).map(into_boxed);
+            }
+            if payload.get("workspace").is_some() {
+                return Err("workspace filters saved history only; live reads remain session-bound".into());
+            }
             let mut patcher = Patcher::with_shared_cache(&ws.root, Arc::clone(&ws.analysis_cache))?;
             let outline = payload.get("outline").and_then(Value::as_bool).unwrap_or(false);
-            let max_bytes = payload.get("max_bytes").and_then(Value::as_u64).map(|n| n as usize);
             let (start, end) = match payload.get("range").and_then(Value::as_str) {
                 Some(spec) => {
                     let mut parts = spec.split('-');
@@ -1465,7 +2191,13 @@ fn run_op(op: &str, payload: &Value, ws: &Workspace) -> Result<Box<dyn OpResult>
                 }
                 None => (None, None),
             };
-            patcher.read_with(query, start, end, outline, max_bytes).map(into_boxed)
+            if payload.get("max_bytes").is_some() {
+                return Err("context.read no longer accepts max_bytes; use range, outline, or streaming".to_string());
+            }
+            let stream = payload.get("stream").and_then(Value::as_bool).unwrap_or(false);
+            patcher.read_with(query, start, end, outline, None).map(|rendered| {
+                if stream { ndjson_read_chunks(query, &rendered) } else { rendered }
+            }).map(into_boxed)
         }
         "verify.check" => {
             let mut patcher = Patcher::with_shared_cache(&ws.root, Arc::clone(&ws.analysis_cache))?;
@@ -1475,20 +2207,19 @@ fn run_op(op: &str, payload: &Value, ws: &Workspace) -> Result<Box<dyn OpResult>
                 .map(|report| crate::render::check_report(&report))
                 .map(into_boxed)
         }
-        "context.log" => {
-            let patcher = Patcher::with_shared_cache(&ws.root, Arc::clone(&ws.analysis_cache))?;
-            if query.trim().is_empty() {
-                patcher.changelog().map(into_boxed)
-            } else {
-                patcher.log(query).map(into_boxed)
-            }
-        }
+        "context.log" => crate::history::list(&ws.root, payload).map(into_boxed),
         "mutate.create" => {
             let _turn = ws.apply_queue.lock().map_err(|_| "apply queue poisoned".to_string())?;
             let path = payload.get("path").and_then(Value::as_str).ok_or("mutate.create needs a path")?;
             let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
             let mut patcher = Patcher::with_shared_cache(&ws.root, Arc::clone(&ws.analysis_cache))?;
             patcher.create(path, content).map(into_boxed)
+        }
+        "mutate.delete" => {
+            let _turn = ws.apply_queue.lock().map_err(|_| "apply queue poisoned".to_string())?;
+            let path = payload.get("path").and_then(Value::as_str).ok_or("mutate.delete needs a path")?;
+            let mut patcher = Patcher::with_shared_cache(&ws.root, Arc::clone(&ws.analysis_cache))?;
+            patcher.delete(path).map(into_boxed)
         }
         "mutate.undo" => {
             let _turn = ws.apply_queue.lock().map_err(|_| "apply queue poisoned".to_string())?;
@@ -1586,7 +2317,7 @@ fn macro_run(ws: &Workspace, payload: &Value) -> Result<MultiOpResult, String> {
     if let Some(validate) = payload.get("validate") {
         steps_payload["validate"] = validate.clone();
     }
-    multi_op(ws, &steps_payload)
+    multi_op(ws, &steps_payload, None)
 }
 
 fn list_macros() -> Result<String, String> {
@@ -1968,6 +2699,7 @@ impl OpResult for FanOutResult {
 }
 
 fn status(context: &Workspace) -> Result<StatusResult, String> {
+    let reindexing = context.reindexing.load(Ordering::Acquire);
     let index = context.index.lock().map_err(|_| "index lock poisoned".to_string())?;
     let refs_state = match &context.refs {
         Some(index) if index.ready() => "warm",
@@ -1982,7 +2714,7 @@ fn status(context: &Workspace) -> Result<StatusResult, String> {
             None => "loading".to_string(),
         }
     };
-    let state = if (context.semantic_requested && semantic_state == "loading") || refs_state == "loading" {
+    let state = if reindexing || (context.semantic_requested && semantic_state == "loading") || refs_state == "loading" {
         "indexing"
     } else {
         "ready"
@@ -1992,6 +2724,7 @@ fn status(context: &Workspace) -> Result<StatusResult, String> {
         state: state.to_string(),
         files: index.store.file_count(),
         symbols: index.store.symbol_count(),
+        oversized: index.oversized_files,
         watcher_live: context.watcher_alive,
         refs_state: refs_state.to_string(),
         semantic_state,
@@ -2004,6 +2737,7 @@ struct StatusResult {
     state: String,
     files: usize,
     symbols: usize,
+    oversized: usize,
     watcher_live: bool,
     refs_state: String,
     semantic_state: String,
@@ -2012,7 +2746,7 @@ struct StatusResult {
 
 impl OpResult for StatusResult {
     fn render(&self) -> String {
-        format!(
+        let mut out = format!(
             "root: {}\nstate: {}\nindexed files: {}\nsymbols: {}\nwatcher: {}\napply queue: serialized in-daemon\nverified refs: {}\nsemantic: {}\nuptime: {}s\n",
             self.root.display(),
             self.state,
@@ -2022,7 +2756,15 @@ impl OpResult for StatusResult {
             self.refs_state,
             self.semantic_state,
             self.uptime
-        )
+        );
+        if self.oversized > 0 {
+            out.push_str(&format!(
+                "over the {} byte index cap: {} file(s), absent from find and explore\n",
+                crate::graph::resolve::max_indexable_bytes(),
+                self.oversized
+            ));
+        }
+        out
     }
     fn to_json(&self) -> Value {
         json!({
@@ -2060,6 +2802,7 @@ fn apply_report_json(report: &crate::patcher::ApplyReport) -> Value {
             "path": s.path,
             "op": s.op,
             "new_tag": s.new_tag,
+            "preview": s.preview,
             "dest": s.dest,
             "first_changed_line": s.first_changed_line,
             "shifts": s.shifts.iter().map(|(after, delta)| json!({"after_line": after, "delta": delta})).collect::<Vec<_>>(),
@@ -2070,45 +2813,49 @@ fn apply_report_json(report: &crate::patcher::ApplyReport) -> Value {
     })
 }
 
-fn run_verify(cwd: &Path, command: &str) -> Result<(), String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("verify command failed to start: {e}"))?;
-    if output.status.success() {
+fn run_verify(cwd: &Path, command: &str, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    let outcome = crate::buildspec::run_command_with_cancel(cwd, command, "multi-op validate", cancelled);
+    if outcome.ok {
         return Ok(());
     }
-    let mut detail = String::from_utf8_lossy(&output.stdout).into_owned();
-    detail.push_str(&String::from_utf8_lossy(&output.stderr));
-    Err(format!("verify `{command}` failed:\n{}", crate::buildspec::head_tail(&detail)))
+    Err(format!("verify `{command}` failed:\n{}", outcome.output))
 }
 
 fn rollback_multi_op(
     patcher: &mut Patcher,
     ledger: &crate::patcher::MultiOpLedger,
     step: usize,
+    operation: &str,
     reason: &str,
 ) -> String {
     let reverted = ledger.actions.len();
-    match patcher.revert_ledger(ledger) {
-        Ok(()) => format!(
-            "multi-op failed at step {}: {reason}; {reverted} prior mutation(s) reverted",
-            step + 1
-        ),
-        Err(e) => format!(
-            "multi-op failed at step {}: {reason}; ROLLBACK ALSO FAILED: {e}",
-            step + 1
-        ),
-    }
+    let rollback = match patcher.revert_ledger(ledger) {
+        Ok(()) => format!("{reverted} prior mutation(s) reverted"),
+        Err(e) => format!("rollback failed: {e}"),
+    };
+    crate::opresult::failure_json(
+        "isohypse",
+        Some(step + 1),
+        Some(operation),
+        None,
+        None,
+        Some(reason),
+        None,
+        Some("re-run the same inline jq multi-op expression after correcting the current/expected content"),
+        Some(&rollback),
+    )
 }
 
 struct MultiOpStepOutcome {
     index: usize,
     op: String,
+    label: Option<String>,
     summary: String,
     json: Value,
+}
+
+fn step_label(step: &Value) -> Option<String> {
+    step.get("label").and_then(Value::as_str).filter(|l| !l.is_empty()).map(str::to_string)
 }
 
 struct MultiOpResult {
@@ -2121,12 +2868,20 @@ impl OpResult for MultiOpResult {
         let kind = if self.transactional { "transactional" } else { "read-only" };
         let mut out = format!("multi-op: {} step(s), {kind}\n", self.items.len());
         for item in &self.items {
-            out.push_str(&format!("-- step {} ({})\n", item.index + 1, item.op));
+            match &item.label {
+                Some(label) => out.push_str(&format!("-- step {} ({}): {label}\n", item.index + 1, item.op)),
+                None => out.push_str(&format!("-- step {} ({})\n", item.index + 1, item.op)),
+            }
             out.push_str(&item.summary);
             if !item.summary.ends_with('\n') {
                 out.push('\n');
             }
         }
+        out.push_str(&format!(
+            "checkpoint: {} completed step(s); last={}\n",
+            self.items.len(),
+            self.items.last().map(|item| item.op.as_str()).unwrap_or("none")
+        ));
         out
     }
     fn to_json(&self) -> Value {
@@ -2134,12 +2889,23 @@ impl OpResult for MultiOpResult {
             self.items
                 .iter()
                 .filter(|i| effect_of(&i.op) == effect)
-                .map(|i| json!({"index": i.index, "op": i.op, "json": i.json}))
+                .map(|i| json!({"index": i.index, "op": i.op, "label": i.label, "json": i.json}))
                 .collect::<Vec<_>>()
         };
         json!({
             "op": "multi-op",
             "transactional": self.transactional,
+            "checkpoint": {
+                "completed": self.items.len(),
+                "last_index": self.items.last().map(|item| item.index),
+                "last_op": self.items.last().map(|item| item.op.as_str()),
+                "effects": self.items.iter().fold(serde_json::Map::new(), |mut counts, item| {
+                    let key = effect_of(&item.op).to_string();
+                    let count = counts.get(&key).and_then(Value::as_u64).unwrap_or(0) + 1;
+                    counts.insert(key, json!(count));
+                    counts
+                }),
+            },
             "context": grouped("context"),
             "mutate": grouped("mutate"),
             "verify": grouped("verify"),
@@ -2160,7 +2926,7 @@ fn effect_of(op: &str) -> &'static str {
     }
 }
 
-fn multi_op(context: &Workspace, payload: &Value) -> Result<MultiOpResult, String> {
+fn multi_op(context: &Workspace, payload: &Value, cancelled: Option<Arc<std::sync::atomic::AtomicBool>>) -> Result<MultiOpResult, String> {
     let steps = payload
         .get("steps")
         .and_then(Value::as_array)
@@ -2169,13 +2935,16 @@ fn multi_op(context: &Workspace, payload: &Value) -> Result<MultiOpResult, Strin
         return Err("multi-op has no steps".to_string());
     }
     for step in steps {
+        let saved_history = step.get("op").and_then(Value::as_str) == Some("context.log")
+            || (step.get("op").and_then(Value::as_str) == Some("context.read") && step.get("tag").is_some());
         if let Some(sel) = step.get("workspace").and_then(Value::as_str) {
-            if !sel.is_empty() && sel != "." {
+            if !saved_history && !sel.is_empty() && sel != "." {
                 return Err(
                     "multi-op steps cannot target other workspaces yet; run the multi-op in the target workspace".to_string(),
                 );
             }
         }
+        context.check_enforce(step.get("op").and_then(Value::as_str).unwrap_or_default())?;
         if step.get("op").and_then(Value::as_str) == Some("mutate.undo") {
             return Err("mutate.undo cannot run inside a multi-op; run it as its own op".to_string());
         }
@@ -2202,6 +2971,7 @@ fn multi_op(context: &Workspace, payload: &Value) -> Result<MultiOpResult, Strin
             items.push(MultiOpStepOutcome {
                 index,
                 op: op.to_string(),
+                label: step_label(step),
                 summary: result.render(),
                 json: result.to_json(),
             });
@@ -2211,9 +2981,13 @@ fn multi_op(context: &Workspace, payload: &Value) -> Result<MultiOpResult, Strin
     let _turn = context.apply_queue.lock().map_err(|_| "apply queue poisoned".to_string())?;
     let caller_cwd = context.root.clone();
     let mut patcher = Patcher::with_shared_cache(&caller_cwd, Arc::clone(&context.analysis_cache))?;
+    patcher.set_cancel_token(cancelled.clone());
     let mut ledger = crate::patcher::MultiOpLedger::default();
     let mut items: Vec<MultiOpStepOutcome> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
+        if cancelled.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) {
+            return Err(rollback_multi_op(&mut patcher, &ledger, index, "cancelled", "command cancelled"));
+        }
         let op = step.get("op").and_then(Value::as_str).unwrap_or_default();
         let step_outcome: Result<(String, Value), String> = match op {
             "mutate.edit" => {
@@ -2228,12 +3002,21 @@ fn multi_op(context: &Workspace, payload: &Value) -> Result<MultiOpResult, Strin
             "mutate.create" => match step.get("path").and_then(Value::as_str) {
                 Some(path) => {
                     let content = step.get("content").and_then(Value::as_str).unwrap_or_default();
-                    patcher.create(path, content).map(|summary| {
+                    patcher.create_with_content(path, content).map(|(summary, content)| {
                         ledger.actions.push(crate::patcher::MultiOpAction::Created(path.to_string()));
-                        (summary, json!({ "op": "mutate.create", "path": path }))
+                        (summary, json!({ "op": "mutate.create", "path": path, "content": content }))
                     })
                 }
                 None => Err("mutate.create step needs a path (arg)".to_string()),
+            },
+            "mutate.delete" => match step.get("path").and_then(Value::as_str) {
+                Some(path) => patcher.delete_with_content(path).map(|(summary, content)| {
+                    // The removed text rides the step json so the host can render a
+                    // deletion diff; it is also the ledger's rollback baseline.
+                    ledger.actions.push(crate::patcher::MultiOpAction::Deleted { path: path.to_string(), content: content.clone() });
+                    (summary, json!({ "op": "mutate.delete", "path": path, "content": content }))
+                }),
+                None => Err("mutate.delete step needs a path (arg)".to_string()),
             },
             _ => run_op(op, step, context).map(|result| (result.render(), result.to_json())),
         };
@@ -2241,23 +3024,27 @@ fn multi_op(context: &Workspace, payload: &Value) -> Result<MultiOpResult, Strin
             Ok((summary, json)) => items.push(MultiOpStepOutcome {
                 index,
                 op: op.to_string(),
+                label: step_label(step),
                 summary,
                 json,
             }),
-            Err(reason) => return Err(rollback_multi_op(&mut patcher, &ledger, index, &reason)),
+            Err(reason) => return Err(rollback_multi_op(&mut patcher, &ledger, index, op, &reason)),
         }
         let checkpoint = step.get("checkpoint").and_then(Value::as_bool).unwrap_or(false);
         if checkpoint {
+            if cancelled.as_ref().is_some_and(|token| token.load(Ordering::Acquire)) {
+                return Err(rollback_multi_op(&mut patcher, &ledger, index, op, "command cancelled"));
+            }
             if let Some(command) = validate.as_deref() {
-                if let Err(reason) = run_verify(&caller_cwd, command) {
-                    return Err(rollback_multi_op(&mut patcher, &ledger, index, &reason));
+                if let Err(reason) = run_verify(&caller_cwd, command, cancelled.as_deref()) {
+                    return Err(rollback_multi_op(&mut patcher, &ledger, index, op, &reason));
                 }
             }
         }
     }
     if let Some(command) = validate.as_deref() {
-        if let Err(reason) = run_verify(&caller_cwd, command) {
-            return Err(rollback_multi_op(&mut patcher, &ledger, steps.len() - 1, &reason));
+        if let Err(reason) = run_verify(&caller_cwd, command, cancelled.as_deref()) {
+            return Err(rollback_multi_op(&mut patcher, &ledger, steps.len() - 1, "validate", &reason));
         }
     }
     Ok(MultiOpResult { items, transactional: true })
@@ -2693,7 +3480,7 @@ pub fn explore(
         };
         return Ok(ExploreResult { text: format!("no match for {terms:?}: {tail}; try `isohypse context read <path>` or a different name\n"), hits: Vec::new() });
     }
-    selected.truncate(options.max * 2);
+    selected.truncate(options.max.saturating_mul(2));
 
     let mut kept: Vec<SymbolRow> = Vec::new();
     for symbol in &selected {

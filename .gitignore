@@ -1,2 +1,6 @@
 target/
 .isohypse/
+__pycache__/
+
+.DS_Store
+harness/codex-denied-*.txt

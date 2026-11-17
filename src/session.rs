@@ -6,6 +6,8 @@ use tokio::sync::mpsc;
 use serde_json::Value;
 
 use crate::frame::{Outbound, Resume};
+use crate::hint::{Hint, RequestKind};
+use crate::policy::Policy;
 
 pub struct Session {
     pub id: String,
@@ -16,6 +18,10 @@ pub struct Session {
     pub scope_kinds: Vec<String>,
     pub scope_workspaces: Vec<String>,
     pub in_flight: HashSet<String>,
+    /// Whether this session has loaded the operation grammar via context.prompt.
+    pub schema_loaded: bool,
+    hint: Hint,
+
     event_tx: Option<mpsc::Sender<Outbound>>,
 }
 
@@ -77,6 +83,8 @@ impl SessionRegistry {
             scope_kinds: Vec::new(),
             scope_workspaces: Vec::new(),
             in_flight: HashSet::new(),
+            schema_loaded: false,
+            hint: Hint::start(),
             event_tx: None,
         };
         crate::objects::persist_session(&crate::objects::PersistedSession {
@@ -85,9 +93,9 @@ impl SessionRegistry {
             observer,
             scope_kinds: Vec::new(),
             scope_workspaces: Vec::new(),
-            token_salt,
-            token_hash,
-        });
+                    token_salt,
+                    token_hash,
+        })?;
         self.with_sessions(|sessions| {
             sessions.insert(id.clone(), session);
         })?;
@@ -173,6 +181,8 @@ impl SessionRegistry {
             scope_kinds: persisted.scope_kinds,
             scope_workspaces: persisted.scope_workspaces,
             in_flight: HashSet::new(),
+            schema_loaded: false,
+            hint: Hint::start(),
             event_tx: None,
         };
         self.with_sessions(|sessions| {
@@ -194,9 +204,10 @@ impl SessionRegistry {
                     scope_workspaces: session.scope_workspaces.clone(),
                     token_salt: session.token_salt.clone(),
                     token_hash: session.token_hash.clone(),
-                });
+                })?;
             }
-        })
+            Ok(())
+        })?
     }
 
     pub fn begin(&self, id: &str, command: &Value) -> Result<(), String> {
@@ -238,6 +249,32 @@ impl SessionRegistry {
         self.with_sessions(|sessions| sessions.get(id).map(|s| s.observer).unwrap_or(false))
             .unwrap_or(false)
     }
+
+    /// A session must read the grammar before it can issue real operations.
+    pub fn schema_loaded(&self, id: &str) -> bool {
+        self.with_sessions(|sessions| sessions.get(id).map(|s| s.schema_loaded).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// True when this request should carry the batching hint.
+    pub fn note_request(&self, id: &str, kind: RequestKind) -> bool {
+        self.with_sessions(|sessions| {
+            let Some(session) = sessions.get_mut(id) else { return false };
+            let (next, emit) = session.hint.observe(kind);
+            session.hint = next;
+            emit
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn mark_schema(&self, id: &str) {
+        let _ = self.with_sessions(|sessions| {
+            if let Some(session) = sessions.get_mut(id) {
+                session.schema_loaded = true;
+            }
+        });
+    }
+
 
     pub fn close(&self, id: &str) {
         let _ = self.with_sessions(|sessions| {
@@ -284,6 +321,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ── unit: session registry and enforce profiles ────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,9 +339,12 @@ mod tests {
         let registry = SessionRegistry::new();
         let (a, _, _) = ready_parts(registry.open("codex", false, None).unwrap());
         let (b, _, _) = ready_parts(registry.open("codex", false, None).unwrap());
-        assert_ne!(a, b, "same label must get distinct ids: {a} vs {b}");
-        assert!(a.starts_with("codex."), "id carries the label: {a}");
-        assert_eq!(registry.count(), 2);
+        let __ok0: bool = (a) != (b);
+        let __ok1: bool = a.starts_with("codex.");
+        let __ok2: bool = (registry.count()) == (2);
+
+        let failed: Vec<&str> = [(__ok0, "same label must get distinct ids: {a} vs {b}"), (__ok1, "id carries the label: {a}"), (__ok2, "registry.count() == 2")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
@@ -312,13 +353,16 @@ mod tests {
         let (id, token, _) = ready_parts(registry.open("agent", false, None).unwrap());
 
         let good = registry.open("agent", false, Some(Resume { session: id.clone(), token: token.clone() }));
-        assert!(good.is_ok(), "correct token resumes: {good:?}");
+        let __ok0: bool = good.is_ok();
 
         let bad = registry.open("agent", false, Some(Resume { session: id.clone(), token: "wrong".to_string() }));
-        assert!(bad.is_err(), "wrong token is refused");
+        let __ok1: bool = bad.is_err();
 
         let missing = registry.open("agent", false, Some(Resume { session: "ghost.0".to_string(), token }));
-        assert!(missing.is_err(), "unknown session is refused");
+        let __ok2: bool = missing.is_err();
+
+        let failed: Vec<&str> = [(__ok0, "correct token resumes: {good:?}"), (__ok1, "wrong token is refused"), (__ok2, "unknown session is refused")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
 
     #[test]
@@ -336,8 +380,35 @@ mod tests {
         let (id, _, _) = ready_parts(registry.open("worker", false, None).unwrap());
         registry.begin(&id, &json!(1)).unwrap();
         registry.begin(&id, &json!(2)).unwrap();
-        assert_eq!(registry.in_flight(&id), 2);
+        let __ok0: bool = (registry.in_flight(&id)) == (2);
         registry.finish(&id, &json!(1)).unwrap();
-        assert_eq!(registry.in_flight(&id), 1);
+        let __ok1: bool = (registry.in_flight(&id)) == (1);
+
+        let failed: Vec<&str> = [(__ok0, "registry.in_flight(&id) == 2"), (__ok1, "registry.in_flight(&id) == 1")].iter().filter(|(ok, _)| !ok).map(|(_, label)| *label).collect();
+        assert_eq!(failed, Vec::<&str>::new(), "these checks failed");
     }
+}
+pub fn builtin_profile(name: &str) -> Option<Policy> {
+    Policy::builtin(name)
+}
+
+/// A built-in profile, or a custom one from config. Err names an invalid custom profile.
+pub fn resolve_profile(name: &str) -> Result<Option<Policy>, String> {
+    if let Some(policy) = Policy::builtin(name) {
+        return Ok(Some(policy));
+    }
+    let config = crate::setup::Config::load();
+    let Some(custom) = config.enforce_profiles.iter().find(|p| p.name == name) else { return Ok(None) };
+    Policy::from_lists(&custom.allowed, &custom.denied).map(Some).map_err(|e| format!("profile {name:?}: {e}"))
+}
+
+pub fn profile_names() -> Vec<String> {
+    let mut names: Vec<String> = ["readonly", "review", "edit", "observe", "full"].iter().map(|s| s.to_string()).collect();
+    let config = crate::setup::Config::load();
+    for p in &config.enforce_profiles {
+        if !names.contains(&p.name) {
+            names.push(p.name.clone());
+        }
+    }
+    names
 }

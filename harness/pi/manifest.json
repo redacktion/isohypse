@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "pisohypse",
+  "harness": "pi",
+  "entrypoint": "pisohypse.ts",
+  "protocol": "isohypse-session-ndjson",
+  "mcp": false,
+  "permissions": {
+    "default": "deny",
+    "workspace": "canonical Pi cwd, no ancestor fallback or fanout",
+    "reads": "explicit session-only grant",
+    "mutations": "explicit full-session grant or exact per-batch confirmation",
+    "validation_shell": "explicit full-session grant or exact per-batch confirmation; daemon OS permissions, not sandboxed"
+  },
+  "unsupported": ["automatic reconnect", "resume", "raw jq", "daemon lifecycle", "macros", "file moves", "file removal", "Claude Code", "ChatGPT Desktop"]
+}

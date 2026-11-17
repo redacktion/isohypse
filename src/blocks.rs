@@ -44,7 +44,8 @@ fn lang_for_content(text: &str) -> Option<Lang> {
         }
         return None;
     }
-    let head = &text[..text.len().min(4096)];
+    let head_end = text.char_indices().take_while(|(index, _)| *index < 4096).last().map(|(index, ch)| index + ch.len_utf8()).unwrap_or(0);
+    let head = &text[..head_end];
     let score = |needles: &[&str]| needles.iter().filter(|n| head.contains(**n)).count();
     let rust = score(&["fn ", "let ", "impl ", "pub ", "::", "-> "]);
     let python = score(&["def ", "import ", "self", "elif ", "None"]);

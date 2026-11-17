@@ -23,10 +23,13 @@ pub fn apply_report(report: &ApplyReport, quiet: bool) -> String {
                     let rendered = section
                         .shifts
                         .iter()
-                        .map(|(after, delta)| format!("{delta:+} after line {after}"))
+                        .map(|(after, delta)| {
+                            let new_line = *after as i64 + *delta;
+                            format!("old line {after} -> new line {new_line} ({delta:+})")
+                        })
                         .collect::<Vec<String>>()
-                        .join(", ");
-                    out.push_str(&format!("  (line shift, old numbering: {rendered})\n"));
+                        .join(", " );
+                    out.push_str(&format!("  (line mapping: {rendered})\n"));
                 }
             }
             _ => out.push_str(&format!("updated [{}]\n", section.path)),

@@ -69,11 +69,14 @@ pub fn fn_signatures(path: &str, text: &str, tree: &tree_sitter::Tree) -> FnInde
     let separator = if dot_separated(lang) { "." } else { "::" };
     let mut out = FnIndex::with_hasher(Xxh3Builder::new());
     let mut containers: Vec<String> = Vec::new();
-    walk_signatures(tree.root_node(), text, separator, &mut containers, &mut out);
+    walk_signatures(tree.root_node(), text, separator, &mut containers, &mut out, 0);
     out
 }
 
-fn walk_signatures(node: Node<'_>, text: &str, separator: &str, containers: &mut Vec<String>, out: &mut FnIndex) {
+fn walk_signatures(node: Node<'_>, text: &str, separator: &str, containers: &mut Vec<String>, out: &mut FnIndex, depth: usize) {
+    if depth >= MAX_TREE_DEPTH {
+        return;
+    }
     match node.kind() {
         "function_item" | "function_signature_item" | "function_definition" | "function_declaration"
         | "generator_function_declaration" | "method_definition" => {
@@ -100,7 +103,7 @@ fn walk_signatures(node: Node<'_>, text: &str, separator: &str, containers: &mut
                     containers.push(strip_generics(node_text(type_node, text)));
                     let mut cursor = body.walk();
                     for child in body.children(&mut cursor) {
-                        walk_signatures(child, text, separator, containers, out);
+                        walk_signatures(child, text, separator, containers, out, depth + 1);
                     }
                     containers.pop();
                 }
@@ -113,7 +116,7 @@ fn walk_signatures(node: Node<'_>, text: &str, separator: &str, containers: &mut
                 containers.push(name);
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    walk_signatures(child, text, separator, containers, out);
+                    walk_signatures(child, text, separator, containers, out, depth + 1);
                 }
                 containers.pop();
                 return;
@@ -123,7 +126,7 @@ fn walk_signatures(node: Node<'_>, text: &str, separator: &str, containers: &mut
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_signatures(child, text, separator, containers, out);
+        walk_signatures(child, text, separator, containers, out, depth + 1);
     }
 }
 
@@ -316,6 +319,7 @@ pub fn extract(path: &str, text: &str) -> Extraction {
                 lang,
                 extraction: Extraction::default(),
                 file_symbol: file_symbol(path, text),
+                depth: 0,
             };
             state.extraction.symbols.push(state.file_symbol.clone());
             walk(&mut state, tree.root_node(), &Scope::default());
@@ -378,12 +382,18 @@ struct Scope {
     dyn_bounds: HashMap<String, String>,
 }
 
+// Bounded tree depth guards the recursive walk against stack overflow.
+// Measured cost is ~5 KB of stack per level across the Rust frames plus the
+// tree-sitter cursor frames, so 128 levels stays far inside a 2 MB thread stack.
+const MAX_TREE_DEPTH: usize = 128;
+
 struct ExtractState<'a> {
     path: &'a str,
     text: &'a str,
     lang: Lang,
     extraction: Extraction,
     file_symbol: SymbolRow,
+    depth: usize,
 }
 
 impl ExtractState<'_> {
@@ -427,6 +437,9 @@ fn dot_separated(lang: Lang) -> bool {
 }
 
 fn walk(state: &mut ExtractState<'_>, node: Node<'_>, scope: &Scope) {
+    if state.depth >= MAX_TREE_DEPTH {
+        return;
+    }
     match state.lang {
         Lang::Rust => walk_rust(state, node, scope),
         Lang::Cpp => walk_cpp(state, node, scope),
@@ -437,10 +450,15 @@ fn walk(state: &mut ExtractState<'_>, node: Node<'_>, scope: &Scope) {
 }
 
 fn walk_children(state: &mut ExtractState<'_>, node: Node<'_>, scope: &Scope) {
+    if state.depth >= MAX_TREE_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
     for child in children {
+        state.depth += 1;
         walk(state, child, scope);
+        state.depth -= 1;
     }
 }
 
@@ -553,7 +571,9 @@ fn walk_rust(state: &mut ExtractState<'_>, node: Node<'_>, scope: &Scope) {
                 }
             }
             if let Some(body) = node.child_by_field_name("body") {
+                state.depth += 1;
                 walk_rust(state, body, &inner);
+                state.depth -= 1;
             }
         }
         "struct_item" | "enum_item" | "union_item" => {
@@ -632,7 +652,9 @@ fn walk_rust(state: &mut ExtractState<'_>, node: Node<'_>, scope: &Scope) {
                     walk_children(state, child, &sequential);
                     rust_record_let(state, child, &mut sequential);
                 } else {
+                    state.depth += 1;
                     walk_rust(state, child, &sequential);
+                    state.depth -= 1;
                 }
             }
         }

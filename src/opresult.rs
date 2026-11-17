@@ -22,3 +22,19 @@ impl OpResult for String {
         json!({ "text": self })
     }
 }
+
+/// Canonical machine-readable failure payload used across CLI, daemon, and session surfaces.
+pub fn failure_json(layer: &str, step: Option<usize>, operation: Option<&str>, path: Option<&str>, tag: Option<&str>, current: Option<&str>, expected: Option<&str>, replay: Option<&str>, rollback: Option<&str>) -> String {
+    json!({
+        "kind": "isohypse_failure",
+        "layer": layer,
+        "step": step,
+        "operation": operation,
+        "path": path,
+        "tag": tag,
+        "current": current,
+        "expected": expected,
+        "replay": replay,
+        "rollback": rollback,
+    }).to_string()
+}

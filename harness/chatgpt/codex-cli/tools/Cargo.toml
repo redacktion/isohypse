@@ -1,0 +1,31 @@
+[package]
+name = "codex-tools"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: keep this crate out of any ancestor cargo workspace.
+[workspace]
+
+[lib]
+name = "codex_tools"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "fetch"
+path = "src/bin/fetch.rs"
+
+[[bin]]
+name = "prepare"
+path = "src/bin/prepare.rs"
+
+[[bin]]
+name = "compile"
+path = "src/bin/compile.rs"
+
+[[bin]]
+name = "modifications"
+path = "src/bin/modifications.rs"

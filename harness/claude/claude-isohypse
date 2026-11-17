@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = "--isohypse-allow-edits" ]; then
+  export ISOHYPSE_ALLOW_EDITS=1
+  shift
+fi
+entry="${ISOHYPSE_CLAUDE_ENTRY:-$HOME/Library/Caches/Isohypse/claude-native/2.1.263-native/cli}"
+bun="${ISOHYPSE_BUN:-$HOME/.bun/bin/bun}"
+if [ ! -f "$entry" ]; then
+  echo "Isohypse Claude copy missing: $entry" >&2
+  exit 1
+fi
+exec "$bun" "$entry" "$@"
